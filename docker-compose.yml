@@ -1,0 +1,42 @@
+# Local stack: gateway + Prometheus.
+#
+#   docker compose up --build
+#   curl localhost:8000/healthz
+#   open http://localhost:9090   (Prometheus)
+#
+# The gateway reaches a llama.cpp server running on your host machine via
+# host.docker.internal. Override the config with your own file by mounting it.
+
+services:
+  groundwire:
+    build: .
+    image: groundwire:dev
+    ports:
+      - "8000:8000"
+    environment:
+      GROUNDWIRE_LOG_LEVEL: INFO
+      GROUNDWIRE_LOG_JSON: "true"
+      GROUNDWIRE_CONFIG_PATH: /app/config/groundwire.docker.yaml
+      # Cloud fallbacks (only used if enabled in the config):
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - ./config:/app/config:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - groundwire
+    restart: unless-stopped

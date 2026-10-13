@@ -1,0 +1,94 @@
+# Docker variant of groundwire.yaml: local servers are reached via host.docker.internal.
+# --------------------------------------------------------------------------- #
+# Groundwire gateway configuration
+#
+# Secrets never go in this file: providers reference an env var via
+# `api_key_env`. Disabled providers are skipped and need no key, so you can
+# enable cloud fallbacks just by exporting a key and flipping `enabled`.
+# --------------------------------------------------------------------------- #
+
+request_timeout_s: 90          # end-to-end deadline across retries + failover
+
+retry:
+  max_attempts: 2              # per provider, before failing over
+  base_delay_s: 0.2
+  max_delay_s: 2.0
+
+circuit_breaker:
+  failure_threshold: 5         # consecutive failures that open the circuit
+  recovery_timeout_s: 30       # how long to stop sending traffic before probing
+  half_open_max_calls: 1
+
+grounding:
+  scorer: lexical              # lexical (no deps) | nli (pip install 'groundwire[nli]')
+  nli_model: cross-encoder/nli-deberta-v3-small
+  support_threshold: 0.6
+  min_supported_ratio: 0.8
+  min_claim_tokens: 3
+  on_error: fail_open          # fail_open | fail_closed
+
+providers:
+  # Local model served by llama.cpp:  llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf --port 8080
+  - name: llama-local
+    type: openai_compatible
+    base_url: http://host.docker.internal:8080/v1
+    model: qwen2.5-3b-instruct
+    timeout_s: 120             # CPU generation is slow; be generous
+    max_connections: 8
+
+  # Ollama exposes an OpenAI-compatible API under /v1.
+  - name: ollama-local
+    type: openai_compatible
+    base_url: http://host.docker.internal:11434/v1
+    model: qwen2.5:3b
+    timeout_s: 120
+    enabled: false
+
+  - name: groq
+    type: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.1-8b-instant
+    api_key_env: GROQ_API_KEY
+    timeout_s: 30
+    enabled: false
+
+  - name: openai
+    type: openai_compatible
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
+    timeout_s: 30
+    enabled: false
+
+  - name: anthropic
+    type: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-haiku-5-5
+    api_key_env: ANTHROPIC_API_KEY
+    timeout_s: 30
+    enabled: false
+
+  # In-process mocks for demos, load tests and chaos tests.
+  - name: mock-flaky
+    type: mock
+    model: mock-1
+    mock:
+      response_text: "Invoice INV-1042 totals 1,200 USD and is due on 15 March."
+      latency_s: 0.05
+      failure_rate: 0.5
+      seed: 7
+
+  - name: mock-stable
+    type: mock
+    model: mock-1
+    mock:
+      response_text: "Invoice INV-1042 totals 1,200 USD and is due on 15 March."
+      latency_s: 0.02
+
+routes:
+  # Local first; cloud providers only take over if enabled and local fails.
+  default: [llama-local, ollama-local, groq, openai, anthropic]
+  # Demonstrates retries, circuit breaking and failover with no network at all.
+  demo: [mock-flaky, mock-stable]
+
+default_route: default
