@@ -1,4 +1,4 @@
-.PHONY: install lint typecheck test cov check run docker-build up down chaos
+.PHONY: install lint typecheck test cov check run docker-build up down chaos demo
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -29,5 +29,8 @@ up:               ## Start gateway + Prometheus
 down:
 	docker compose down
 
-chaos:            ## Fire 500 requests at the flaky demo route
+chaos:            ## Fire 500 requests at an already-running gateway (start it with `make run`)
 	python scripts/chaos_demo.py --requests 500 --concurrency 50
+
+demo:             ## One command: start a temporary gateway, run the chaos test, stop it
+	./scripts/run_demo.sh --requests 500 --concurrency 50

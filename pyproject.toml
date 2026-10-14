@@ -71,6 +71,11 @@ testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "-q --strict-markers"
 markers = ["integration: tests that wire the full FastAPI app"]
+filterwarnings = [
+    # Third-party: newer Starlette nags about its own TestClient's httpx usage.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["groundwire"]

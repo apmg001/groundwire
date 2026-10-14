@@ -162,17 +162,29 @@ one) and `X-Groundwire-Provider`. All log lines for a request share its ID.
 
 ## Chaos demo
 
+One command (starts a temporary gateway, runs the test, stops the gateway):
+
 ```bash
-make run          # terminal 1
-make chaos        # terminal 2: 500 requests, 50 concurrent, at the flaky route
+make demo
 ```
+
+Or, against a gateway you started yourself:
+
+```bash
+make run          # terminal 1: keep this running
+make chaos        # terminal 2
+```
+
+`make chaos` is only a client. If no gateway is running it stops immediately
+with a hint instead of sending traffic.
 
 Example run (in-process mocks; numbers measure gateway overhead, not model speed):
 
 ```
-requests: 500 in 1.02s (488 req/s)
-status codes: {200: 500}
-served by: {'mock-stable': 418, 'mock-flaky': 82}
+requests:       500 in 0.86s (583 req/s)
+status codes:   {200: 500}
+served by:      {'mock-flaky': 60, 'mock-stable': 440}
+latency:        p50=64.8ms  p95=234.0ms  p99=324.3ms
 circuit states: {'mock-flaky': 'open', 'mock-stable': 'closed'}
 ```
 
