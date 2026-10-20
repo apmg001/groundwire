@@ -139,10 +139,55 @@ than silently switching models mid-sentence.
 
 | Scorer | Install | Catches | Misses |
 |---|---|---|---|
-| `lexical` (default) | nothing | Invented numbers/amounts/dates/IDs; claims with little overlap with the context | Paraphrased contradictions ("did" vs "did not") |
-| `nli` | `pip install 'groundwire[nli]'` | Semantic entailment and contradiction (DeBERTa cross-encoder) | Costs ~tens of ms per claim on CPU |
+| `lexical` (default) | nothing | Invented numbers, amounts, dates, times and IDs; claims with little overlap with the context | Paraphrased contradictions ("did" vs "did not") |
+| `nli` | `make install-nli` | Semantic entailment and contradiction (DeBERTa cross-encoder) | Weak on exact numbers; tens of ms per claim on CPU |
+| `hybrid` | `make install-nli` | Both: a numeric gate rejects wrong numbers without running the model, NLI judges the rest | Slower than lexical |
 
+Numbers are normalised before comparison (`1,200.00` = `1200`), and so are clock times (`5 pm` = `5:00 PM` = `17:0`).
 Scoring is CPU-bound, so it runs in a worker thread behind a concurrency limit and never blocks the event loop.
+
+---
+
+## Benchmark: does the fact-checker actually work?
+
+Measured on **[RAGTruth](https://github.com/ParticleMedia/RAGTruth)**: 2,700 real LLM answers to
+retrieval-augmented prompts (question answering, news summaries, and descriptions written from
+business data), each labelled by human annotators as hallucinated or not.
+
+The benchmark runs the **same verifier the gateway uses**. The decision threshold is tuned on the
+*train* split and applied unchanged to the *test* split, so the numbers are not tuned on the data
+they report. A response counts as flagged if any of its claims scores below the threshold.
+
+### Lexical scorer (default, no ML model), full test set
+
+| Task | Responses | Hallucinated | Precision | Recall | F1 | F1 if flagging everything | ROC-AUC | Good answers blocked | Latency p50 |
+|---|---|---|---|---|---|---|---|---|---|
+| **All tasks** | 2700 | 34.9% | 54.2% | 76.7% | **63.5%** | 51.8% | **0.735** | 34.8% | 3 ms |
+| QA | 900 | 17.8% | 39.9% | 54.4% | 46.0% | 30.2% | 0.769 | 17.7% | 1 ms |
+| Summary | 900 | 22.7% | 31.7% | 48.0% | 38.2% | 37.0% | 0.635 | 30.3% | 2 ms |
+| Data2txt | 900 | 64.3% | 66.6% | 92.9% | 77.6% | 78.3% | 0.583 | 84.1% | 9 ms |
+
+**What this shows, honestly:**
+
+- Overall it clearly beats the trivial "flag everything" baseline (F1 63.5% vs 51.8%), in about 3 ms per answer and with no model.
+- It works best on **QA**, where hallucinations are often wrong facts and numbers (F1 46.0% vs a 30.2% baseline).
+- It is **not good enough on its own** for summaries or structured data. On Data2txt it blocks most correct answers and is no better than the baseline, because correct answers paraphrase the data in words it can't match. That is the gap the `nli` and `hybrid` scorers are for.
+- Error analysis on Data2txt found correct answers being rejected because opening hours were written differently (`11 am` vs `11:0`). Normalising clock times fixed that bug and raised Data2txt ROC-AUC from 0.519 to 0.583.
+
+NLI and hybrid results: *coming soon* (they need a model download; run them yourself with the commands below).
+
+### Reproduce
+
+```bash
+make bench            # lexical, full test set, about a minute
+make install-nli      # once: CPU-only torch + transformers
+make bench-nli        # NLI, 100 answers per task
+make bench-hybrid     # numeric gate + NLI, 100 answers per task
+```
+
+Each run writes `results/<timestamp>-<scorer>/` containing `report.md` (the table above),
+`summary.json`, and `predictions.jsonl` with the weakest claim of every answer for error analysis.
+See `python -m groundwire.evals --help` for sampling, label policy and threshold options.
 
 ---
 
@@ -201,7 +246,8 @@ src/groundwire/
   services/       ChatService: deadline, grounding policy, metrics
   routing/        Router: fallback chains, failover, streaming handoff
   resilience/     RetryPolicy, CircuitBreaker
-  guardrails/     text utils, scorers (lexical, NLI), GroundingVerifier
+  guardrails/     text utils, scorers (lexical, NLI, hybrid), GroundingVerifier
+  evals/          RAGTruth benchmark: loader, metrics, runner, report, CLI
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
   core/           config, errors, logging, request context
@@ -216,11 +262,13 @@ scripts/          chaos demo
 ## Roadmap
 
 - [x] Gateway core, streaming, failover, retries, circuit breakers, deadlines
-- [x] Grounding verification (lexical + NLI), flag/block policies
+- [x] Grounding verification (lexical, NLI, hybrid), flag/block policies
+- [x] Reproducible RAGTruth benchmark with train-tuned thresholds
 - [x] Metrics, structured logs, Docker, CI
 - [ ] Semantic cache (embeddings + Redis/pgvector)
 - [ ] Prompt-injection detection and PII redaction
-- [ ] Eval harness with a CI regression gate; RAGTruth/HaluEval benchmark
+- [ ] NLI and hybrid benchmark results
+- [ ] Eval harness with a CI regression gate
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

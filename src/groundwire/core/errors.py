@@ -280,3 +280,14 @@ class GuardrailUnavailableError(GroundwireError):
 
     http_status = 503
     code = "guardrail_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation errors
+# --------------------------------------------------------------------------- #
+
+
+class DatasetError(GroundwireError):
+    """A benchmark dataset is missing, unreadable or malformed."""
+
+    code = "dataset_error"

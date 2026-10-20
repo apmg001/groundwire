@@ -145,3 +145,22 @@ def test_nli_entailment_index_lookup() -> None:
     assert NLIScorer._find_entailment_index(
         {0: "contradiction", 1: "entailment", 2: "neutral"}) == 1
     assert NLIScorer._find_entailment_index({0: "ENTAILMENT", 1: "NOT_ENTAILMENT"}) == 0
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("Open 11 am to 5:30 PM", {"t11:00", "t17:30"}),
+    ("hours: 11:0-17:30", {"t11:00", "t17:30"}),
+    ("from 9:00 a.m. until 2 p.m.", {"t09:00", "t14:00"}),
+    ("12 pm and 12 am", {"t12:00", "t00:00"}),
+    ("score 25:99", {"25", "99"}),  # not a valid time: kept as plain numbers
+])
+def test_numbers_normalise_clock_times(text: str, expected: set[str]) -> None:
+    assert numbers(text) == expected
+
+
+def test_lexical_accepts_same_time_in_different_formats() -> None:
+    passage = "hours.Monday: 11:0-17:0."
+    # Same times, different format: passes the number gate (scored on word overlap).
+    assert LexicalScorer().score(passage, "It is open from 11 am to 5 pm on Monday.") > 0.0
+    # A genuinely different opening time is still rejected outright.
+    assert LexicalScorer().score(passage, "It is open from 9 am to 5 pm on Monday.") == 0.0

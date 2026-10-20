@@ -19,7 +19,7 @@ circuit_breaker:
   half_open_max_calls: 1
 
 grounding:
-  scorer: lexical              # lexical (no deps) | nli (pip install 'groundwire[nli]')
+  scorer: lexical              # lexical (no deps) | nli | hybrid (nli + hybrid need: pip install -e ".[nli]")
   nli_model: cross-encoder/nli-deberta-v3-small
   support_threshold: 0.6
   min_supported_ratio: 0.8

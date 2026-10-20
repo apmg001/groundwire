@@ -181,6 +181,7 @@ class GroundingScorerType(StrEnum):
 
     LEXICAL = "lexical"  # fast, dependency-free; checks content words and numbers
     NLI = "nli"  # transformer NLI model; needs the `nli` extra
+    HYBRID = "hybrid"  # numeric gate + NLI; needs the `nli` extra
 
 
 class GroundingFailurePolicy(StrEnum):

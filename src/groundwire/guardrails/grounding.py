@@ -29,7 +29,12 @@ from typing import Any
 
 from groundwire.core.config import GroundingConfig, GroundingFailurePolicy, GroundingScorerType
 from groundwire.core.errors import GuardrailUnavailableError
-from groundwire.guardrails.scorers import LexicalScorer, NLIScorer, SupportScorer
+from groundwire.guardrails.scorers import (
+    HybridScorer,
+    LexicalScorer,
+    NLIScorer,
+    SupportScorer,
+)
 from groundwire.guardrails.text import chunk_passages, content_tokens, split_claims
 
 logger = logging.getLogger(__name__)
@@ -212,6 +217,27 @@ def _ms_since(started: float) -> float:
     return (time.perf_counter() - started) * 1000
 
 
+def build_scorer(config: GroundingConfig) -> SupportScorer:
+    """Build the configured support scorer.
+
+    Args:
+        config: Grounding configuration.
+
+    Returns:
+        The scorer.
+
+    Raises:
+        ConfigurationError: If an NLI-based scorer is selected but the model
+            or the ``nli`` extra is unavailable.
+    """
+    if config.scorer is GroundingScorerType.LEXICAL:
+        return LexicalScorer()
+    nli = NLIScorer.load(config.nli_model)
+    if config.scorer is GroundingScorerType.HYBRID:
+        return HybridScorer(nli)
+    return nli
+
+
 def build_verifier(config: GroundingConfig) -> GroundingVerifier:
     """Build a verifier with the configured scorer.
 
@@ -222,11 +248,6 @@ def build_verifier(config: GroundingConfig) -> GroundingVerifier:
         The verifier.
 
     Raises:
-        ConfigurationError: If the NLI scorer is selected but cannot load.
+        ConfigurationError: If an NLI-based scorer is selected but cannot load.
     """
-    scorer: SupportScorer
-    if config.scorer is GroundingScorerType.NLI:
-        scorer = NLIScorer(config.nli_model)
-    else:
-        scorer = LexicalScorer()
-    return GroundingVerifier(config, scorer)
+    return GroundingVerifier(config, build_scorer(config))

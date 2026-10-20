@@ -15,3 +15,7 @@ htmlcov/
 *.gguf
 .idea/
 .vscode/
+
+# Benchmark data and outputs
+data/
+results/

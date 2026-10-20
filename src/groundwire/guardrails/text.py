@@ -14,6 +14,12 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
 _BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 _WORD = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 _NUMBER = re.compile(r"(?<![\w.])[-+]?\d[\d,]*(?:\.\d+)?%?")
+# Clock times: "9 am", "11:30 PM", "5p.m." (12-hour) or "16:30", "21:0" (24-hour).
+_TIME = re.compile(
+    r"(?<![\w.:])(\d{1,2})(?::(\d{1,2}))?\s*([ap])\.?\s*m\b\.?"
+    r"|(?<![\w.:])(\d{1,2}):(\d{1,2})(?!\d)",
+    re.IGNORECASE,
+)
 
 STOPWORDS: frozenset[str] = frozenset({
     "a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in", "on",
@@ -72,17 +78,56 @@ def content_tokens(text: str) -> set[str]:
     }
 
 
+def _time_token(match: re.Match[str]) -> str | None:
+    """Convert a clock-time match to a canonical ``"tHH:MM"`` token.
+
+    Args:
+        match: A :data:`_TIME` match.
+
+    Returns:
+        The token, or ``None`` if the values are not a valid time.
+    """
+    if match.group(3):  # 12-hour form
+        hour, minute = int(match.group(1)), int(match.group(2) or 0)
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if match.group(3).lower() == "p" else 0)
+    else:  # 24-hour form
+        hour, minute = int(match.group(4)), int(match.group(5))
+        if hour > 24:
+            return None
+        hour %= 24
+    if minute > 59:
+        return None
+    return f"t{hour:02d}:{minute:02d}"
+
+
 def numbers(text: str) -> set[str]:
-    """Extract normalised numbers ("1,200.00" -> "1200", "15%" -> "15%").
+    """Extract normalised numbers and clock times.
+
+    Plain numbers: ``"1,200.00" -> "1200"``, ``"15%" -> "15%"``.
+    Clock times in any common format map to one 24-hour token, so
+    ``"5 pm"``, ``"5:00 PM"`` and ``"17:0"`` all become ``"t17:00"``.
+    Without this, an answer that correctly says "open 11 am to 5 pm" would
+    look invented against source data that stores ``"11:0-17:0"``.
 
     Args:
         text: Input text.
 
     Returns:
-        Set of normalised number strings.
+        Set of normalised number and time strings.
     """
     found: set[str] = set()
-    for match in _NUMBER.findall(text):
+
+    def replace_time(match: re.Match[str]) -> str:
+        token = _time_token(match)
+        if token is None:
+            return match.group(0)
+        found.add(token)
+        return " "
+
+    remainder = _TIME.sub(replace_time, text)
+    for match in _NUMBER.findall(remainder):
         raw = match.replace(",", "").lstrip("+")
         percent = raw.endswith("%")
         raw = raw.rstrip("%")
