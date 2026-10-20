@@ -38,6 +38,19 @@ safety:
     types: [email, phone, card, aadhaar, pan, ip_address]
     restore_output: true       # put real values back into the answer for the client
 
+cache:
+  enabled: true                # reuse earlier answers: saves tokens, money and latency
+  semantic: false              # true = also match reworded questions (needs: make install-nli)
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  similarity_threshold: 0.92   # cosine similarity needed for a semantic hit (higher = safer)
+  ttl_s: 3600                  # answers expire after an hour
+  max_entries: 10000           # least recently used answers are evicted beyond this
+  max_temperature: 1.0         # hotter requests asked for variety; don't cache them
+  lookup_timeout_s: 0.5        # a slow cache is skipped, never waited on
+  coalesce: true               # identical in-flight requests share one provider call
+  partition_by_user: false     # true = separate cache per OpenAI `user` (multi-tenant)
+  namespace: v1                # bump to invalidate everything (e.g. new system prompt)
+
 providers:
   # Local model served by llama.cpp:  llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf --port 8080
   - name: llama-local

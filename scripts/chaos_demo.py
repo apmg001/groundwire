@@ -127,7 +127,10 @@ async def send_one(client: httpx.AsyncClient, route: str,
         The request's outcome. Transport errors are recorded, not raised,
         so one failure never aborts the whole run.
     """
-    body = {"model": route, "messages": [{"role": "user", "content": "ping"}]}
+    # Bypass the response cache: this test measures failover, and 500 identical
+    # "ping" requests would otherwise be answered from cache after the first.
+    body = {"model": route, "messages": [{"role": "user", "content": "ping"}],
+            "groundwire": {"cache": {"mode": "bypass"}}}
     async with sem:
         started = time.perf_counter()
         try:

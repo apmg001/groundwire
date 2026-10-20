@@ -74,6 +74,25 @@ class GatewayMetrics:
         self.grounding_latency = Histogram(
             "groundwire_grounding_duration_seconds", "Grounding check latency.",
             buckets=_LATENCY_BUCKETS, registry=r)
+        self.cache_lookups = Counter(
+            "groundwire_cache_lookups_total",
+            "Cache lookups (hit_exact, hit_semantic, miss, bypass, error).",
+            ["result"], registry=r)
+        self.cache_stores = Counter(
+            "groundwire_cache_stores_total", "Cache writes (stored, skipped, error).",
+            ["outcome"], registry=r)
+        self.cache_lookup_latency = Histogram(
+            "groundwire_cache_lookup_duration_seconds", "Cache lookup latency.",
+            buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1),
+            registry=r)
+        self.cache_entries = Gauge(
+            "groundwire_cache_entries", "Entries currently held by the cache.", registry=r)
+        self.cache_tokens_saved = Counter(
+            "groundwire_cache_tokens_saved_total",
+            "Provider tokens not spent because an answer was served from cache.", registry=r)
+        self.coalesced_requests = Counter(
+            "groundwire_coalesced_requests_total",
+            "Requests answered by an identical in-flight request.", registry=r)
 
     # ------------------------------------------------------------------ #
     # Recording helpers

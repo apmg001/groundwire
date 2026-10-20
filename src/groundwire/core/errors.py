@@ -289,6 +289,17 @@ class GuardrailUnavailableError(GroundwireError):
     code = "guardrail_unavailable"
 
 
+class CacheUnavailableError(GroundwireError):
+    """The response cache could not serve a lookup or store an entry.
+
+    Internal only: the chat service catches it and carries on without the
+    cache (fail-open), so clients never see this error.
+    """
+
+    http_status = 503
+    code = "cache_unavailable"
+
+
 # --------------------------------------------------------------------------- #
 # Evaluation errors
 # --------------------------------------------------------------------------- #

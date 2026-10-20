@@ -87,16 +87,38 @@ class GroundingOptions(BaseModel):
     mode: GroundingMode = GroundingMode.FLAG
 
 
+class CacheMode(StrEnum):
+    """Per-request cache behaviour (like HTTP ``Cache-Control``)."""
+
+    USE = "use"  # read from and write to the cache (default)
+    BYPASS = "bypass"  # neither read nor write: always ask the provider
+    REFRESH = "refresh"  # skip the read, ask the provider, overwrite the entry
+
+
+class CacheOptions(BaseModel):
+    """Per-request cache options.
+
+    Attributes:
+        mode: How this request uses the cache.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: CacheMode = CacheMode.USE
+
+
 class GroundwireOptions(BaseModel):
     """Container for gateway-specific request options.
 
     Attributes:
         grounding: Enable grounding verification for this request.
+        cache: Override cache behaviour for this request.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     grounding: GroundingOptions | None = None
+    cache: CacheOptions | None = None
 
 
 # --------------------------------------------------------------------------- #

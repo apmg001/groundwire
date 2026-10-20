@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from groundwire.cache import ResponseCache, build_cache
 from groundwire.core.config import GatewayConfig
 from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
 from groundwire.observability.metrics import GatewayMetrics
@@ -33,6 +34,7 @@ class Container:
         router: Provider router.
         verifier: Grounding verifier.
         safety: Prompt-injection and PII guard.
+        cache: Response cache (``None`` when disabled).
         chat: Chat completion service.
     """
 
@@ -42,6 +44,7 @@ class Container:
     router: Router
     verifier: GroundingVerifier
     safety: SafetyGuard
+    cache: ResponseCache | None
     chat: ChatService
 
     async def aclose(self) -> None:
@@ -56,6 +59,7 @@ def build_container(
     providers: dict[str, Provider] | None = None,
     verifier: GroundingVerifier | None = None,
     safety: SafetyGuard | None = None,
+    cache: ResponseCache | None = None,
 ) -> Container:
     """Wire up every component from configuration.
 
@@ -64,13 +68,14 @@ def build_container(
         providers: Pre-built providers (tests); built from config if omitted.
         verifier: Pre-built verifier (tests); built from config if omitted.
         safety: Pre-built safety guard (tests); built from config if omitted.
+        cache: Pre-built response cache (tests); built from config if omitted.
 
     Returns:
         The container.
 
     Raises:
-        ConfigurationError: On missing API keys, unloadable scorer models, or
-            routes without enabled providers.
+        ConfigurationError: On missing API keys, unloadable scorer or embedding
+            models, or routes without enabled providers.
     """
     built_providers = providers if providers is not None else build_providers(config)
     # No cleanup is needed if wiring below fails: httpx clients open no sockets
@@ -79,7 +84,9 @@ def build_container(
     router = Router(config, built_providers, metrics=metrics)
     grounding = verifier or build_verifier(config.grounding)
     guard = safety or SafetyGuard(config.safety, metrics=metrics)
+    response_cache = cache or build_cache(config.cache, metrics=metrics)
     chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
-                       safety=guard)
+                       safety=guard, cache=response_cache)
     return Container(config=config, providers=built_providers, metrics=metrics,
-                     router=router, verifier=grounding, safety=guard, chat=chat)
+                     router=router, verifier=grounding, safety=guard, cache=response_cache,
+                     chat=chat)

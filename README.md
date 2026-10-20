@@ -10,6 +10,9 @@ OpenAI SDK at it by changing one URL, and every call gets:
 - **End-to-end deadlines**, so a slow upstream can't hang your app.
 - **Grounding verification**: checks the answer against the context you supplied
   and flags or blocks unsupported claims (invented amounts, dates, IDs).
+- **Prompt-injection screening and PII redaction** before any model sees the request.
+- **Exact + semantic response cache** with request coalescing: repeat and reworded
+  questions are answered without a model call.
 - **Structured JSON logs** with request IDs, and **Prometheus metrics**.
 
 Runs fully offline on a laptop CPU. No GPU, no cloud account required.
@@ -28,7 +31,9 @@ flowchart LR
         RT --> CB1{{Breaker}} --> R1[Retry] --> P1[llama.cpp]
         RT --> CB2{{Breaker}} --> R2[Retry] --> P2[OpenAI / Groq]
         RT --> CB3{{Breaker}} --> R3[Retry] --> P3[Anthropic]
-        SVC --> GV[Grounding verifier<br/>lexical · NLI]
+        SVC --> SG[Safety guard<br/>injection · PII]
+        SVC --> RC[(Response cache<br/>exact · semantic)]
+        SVC --> GV[Grounding verifier<br/>lexical · NLI · token]
         SVC -.-> M[(Prometheus metrics)]
     end
 ```
@@ -42,6 +47,8 @@ flowchart LR
 | Routing | `routing/` | Fallback chains, breakers, retries |
 | Resilience | `resilience/` | Backoff math, breaker state machine |
 | Guardrails | `guardrails/` | Claim splitting, support scoring |
+| Safety | `safety/` | Injection rules/classifier, PII detection and vault |
+| Cache | `cache/` | Keys, embeddings, store port + in-memory adapter, coalescing |
 | Adapters | `providers/` | Vendor wire formats, error classification |
 | Core | `core/`, `domain/` | Config, errors, logging, models |
 
@@ -189,6 +196,57 @@ memory for that request, and only counts are logged.
 
 ---
 
+## Response cache: exact, semantic, coalesced
+
+Configured under `cache:`. A lookup runs after PII redaction and before any provider call:
+
+1. **Exact**: hash of the normalised question (case, spacing and trailing punctuation ignored).
+   Always on and needs no extra dependencies.
+2. **Semantic** (`semantic: true`, needs `make install-nli`): the question is embedded with
+   [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+   (Apache-2.0, 22M params, CPU) and matched against earlier questions by cosine similarity.
+3. **Coalescing**: identical requests that arrive while the first is still running wait for
+   its answer instead of each calling the provider (no cache stampede).
+
+```json
+"groundwire": {
+  "provider": "cache",
+  "cache": {"status": "hit", "match": "semantic", "similarity": 0.9431, "age_s": 12.4, "tokens_saved": 21}
+}
+```
+
+**When two requests may share an answer.** Only when the model would have seen the same input:
+same route, sampling parameters, conversation history, grounding documents and `namespace` tag
+(and the same `user`, with `partition_by_user: true`). Only the latest message is matched
+semantically, and a semantic match is rejected if the two questions mention **different
+numbers** (`order 7781` vs `order 7782` embed almost identically) or **different PII
+placeholders**.
+
+**Safety properties:**
+
+- **No PII in the cache.** Keys and answers are stored in redacted form (`[EMAIL_1]`); each
+  request restores its own values. Two customers asking the same question share the answer, not
+  each other's data.
+- **No cache poisoning via injection.** A prompt with any injection finding is never cached.
+- **No caching of bad answers.** Answers that fail grounding, were cut off
+  (`finish_reason: length`), or are empty are not stored.
+- **Fail-open.** A broken store, a crashed embedder, or a lookup slower than
+  `lookup_timeout_s` is logged and counted, and the request goes to the provider.
+
+**Per-request control** (like HTTP `Cache-Control`): `"groundwire": {"cache": {"mode": "bypass"}}`
+skips the cache, and `"refresh"` skips the read and overwrites the entry. Requests hotter than
+`max_temperature` are not cached, because the caller asked for variety.
+
+**Scaling out.** `cache/store.py` defines a `CacheStore` port. The in-memory adapter is bounded
+(LRU, `max_entries`), expiring (`ttl_s`) and partitioned by namespace. For several replicas
+sharing one cache, implement the port on Redis or pgvector; nothing else changes.
+
+**Limit, stated plainly:** `similarity_threshold: 0.92` is a conservative starting point, not a
+measured optimum. Embeddings can rate "enable X" and "disable X" as similar, so keep the threshold
+high and measure on your own traffic before lowering it.
+
+---
+
 ## Benchmark: does the fact-checker actually work?
 
 Measured on **[RAGTruth](https://github.com/ParticleMedia/RAGTruth)**: 2,700 real LLM answers to
@@ -292,7 +350,7 @@ See `python -m groundwire.evals --help` for sampling, label policy and threshold
 |---|---|
 | `GET /healthz` | Liveness: process is up. Never touches providers. |
 | `GET /readyz` | Readiness: 503 if any route has every circuit open. |
-| `GET /metrics` | Prometheus: requests, latency, attempts, failovers, circuit state, tokens, grounding verdicts. |
+| `GET /metrics` | Prometheus: requests, latency, attempts, failovers, circuit state, tokens, grounding verdicts, injection checks, PII redactions, cache hits/misses, tokens saved, coalesced requests. |
 | `GET /v1/models` | Route aliases and their provider chains. |
 
 Every response carries `X-Request-ID` (your own value is reused if you send
@@ -338,11 +396,12 @@ some failures, the breaker opens and routes around the rest.
 ```
 src/groundwire/
   api/            routes, ASGI middleware (request ID, body limit), error mapping
-  services/       ChatService: deadline, grounding policy, metrics
+  services/       ChatService: safety, cache, deadline, grounding policy, metrics
   routing/        Router: fallback chains, failover, streaming handoff
   resilience/     RetryPolicy, CircuitBreaker
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
+  cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
   evals/          RAGTruth benchmark: loader, metrics, runner, report, CLI
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
@@ -361,10 +420,12 @@ scripts/          chaos demo
 - [x] Grounding verification (lexical, NLI, hybrid), flag/block policies
 - [x] Reproducible RAGTruth benchmark with train-tuned thresholds
 - [x] Metrics, structured logs, Docker, CI
-- [ ] Semantic cache (embeddings + Redis/pgvector)
 - [x] Prompt-injection screening (heuristic + optional classifier) and PII redaction with restoration
 - [x] NLI and hybrid benchmark results (negative result, documented)
 - [x] Token-classifier (LettuceDetect) benchmark: 76.1% F1, reproduces the published result
+- [x] Exact + semantic response cache with coalescing, PII-safe keys, fail-open
+- [ ] Semantic-cache benchmark (false-hit rate vs threshold on a paraphrase dataset)
+- [ ] Redis/pgvector cache adapter for multi-replica deployments
 - [ ] Eval harness with a CI regression gate
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
