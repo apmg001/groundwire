@@ -1,5 +1,5 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
-        bench-data bench bench-nli bench-hybrid
+        bench-data bench bench-nli bench-hybrid bench-token
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -51,3 +51,7 @@ bench-nli: bench-data  ## NLI scorer on 100 test responses per task (needs make 
 
 bench-hybrid: bench-data  ## Numeric gate + NLI (needs make install-nli)
 	python -m groundwire.evals --scorer hybrid --per-task 100 --dev-per-task 50 --evidence-passages 3
+
+bench-token: bench-data  ## LettuceDetect token classifier, full test set, native 0.5 threshold
+	python -m groundwire.evals --scorer token --per-task 0 --dev-per-task 0 \
+		--threshold 0.5 --aggregation min --min-claim-tokens 1

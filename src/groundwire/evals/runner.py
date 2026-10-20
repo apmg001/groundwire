@@ -84,7 +84,8 @@ async def evaluate(verifier: GroundingVerifier,
     started = time.perf_counter()
     for index, example in enumerate(examples, start=1):
         try:
-            report = await verifier.verify(example.response, list(example.context))
+            report = await verifier.verify(example.response, list(example.context),
+                                          prompt=example.prompt)
         except GuardrailUnavailableError:
             logger.exception("verifier failed (fail-closed)", extra={"example": example.id})
             raise

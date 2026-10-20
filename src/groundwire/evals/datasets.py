@@ -64,6 +64,8 @@ class EvalExample:
         response: Model response under test.
         is_hallucinated: Ground-truth label.
         meta: Extra fields kept for analysis (generating model, span types).
+        prompt: The exact prompt the response was generated from, if known
+            (used verbatim by token detectors).
     """
 
     id: str
@@ -72,6 +74,7 @@ class EvalExample:
     response: str
     is_hallucinated: bool
     meta: dict[str, Any] = field(default_factory=dict)
+    prompt: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +258,7 @@ def load_ragtruth(
             is_hallucinated=ragtruth_label(labels, label_policy),
             meta={"model": record.get("model"),
                   "span_types": sorted({str(s.get("label_type")) for s in labels})},
+            prompt=str(source["prompt"]) if source.get("prompt") else None,
         ))
 
     rng = random.Random(seed)  # noqa: S311 - reproducible sampling, not crypto

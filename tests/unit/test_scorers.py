@@ -200,3 +200,18 @@ def test_hybrid_skips_model_when_everything_fails_the_gate() -> None:
 def test_hybrid_detects_wrong_length_from_semantic_scorer() -> None:
     with pytest.raises(GuardrailUnavailableError):
         HybridScorer(_RecordingScorer(wrong_length=True)).score_batch([("a b", "a b")])
+
+
+def test_build_scorer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from groundwire.guardrails.token_detector import TransformersTokenDetector
+
+    seen: dict[str, Any] = {}
+
+    def fake_load(cls: type, name: str, **kwargs: Any) -> str:
+        seen.update(name=name, **kwargs)
+        return "token-detector"
+
+    monkeypatch.setattr(TransformersTokenDetector, "load", classmethod(fake_load))
+    config = GroundingConfig(scorer=GroundingScorerType.TOKEN, token_max_length=2048)
+    assert build_scorer(config) == "token-detector"
+    assert seen == {"name": "KRLabsOrg/lettucedect-base-modernbert-en-v1", "max_length": 2048}

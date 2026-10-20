@@ -360,3 +360,44 @@ def test_cli_missing_data_returns_1(tmp_path: Path) -> None:
 def test_cli_argument_validation(argv: list[str]) -> None:
     with pytest.raises(SystemExit):
         parse_args(argv)
+
+
+async def test_runner_passes_dataset_prompt_to_token_detectors(tmp_path: Path) -> None:
+    from groundwire.core.config import AnswerAggregation
+    from groundwire.guardrails.token_detector import TokenDetector, TokenProb
+
+    class Recorder(TokenDetector):
+        name = "rec"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def detect(self, prompt: str, answer: str) -> list[TokenProb]:
+            self.prompts.append(prompt)
+            return [TokenProb(0, len(answer), 0.8)]
+
+    sources = [dict(SOURCES[1], prompt="Summarize the following news within 116 words: ...")]
+    root = _write(tmp_path / "r", sources, [r for r in _responses() if r["source_id"] == "s2"])
+    examples = load_ragtruth(root, tasks=["Summary"])
+    assert examples[0].prompt == "Summarize the following news within 116 words: ..."
+    recorder = Recorder()
+    config = GroundingConfig(aggregation=AnswerAggregation.MIN, min_claim_tokens=1)
+    results = await evaluate(GroundingVerifier(config, recorder), examples)
+    assert recorder.prompts[0] == examples[0].prompt
+    assert results[0].support_score == pytest.approx(0.2)
+
+
+def test_cli_token_scorer_uses_token_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from groundwire.core.config import GroundingScorerType
+    from groundwire.evals import cli
+    from groundwire.guardrails.token_detector import TransformersTokenDetector
+
+    seen: dict[str, object] = {}
+
+    def fake_load(cls: type, name: str, **kwargs: object) -> str:
+        seen["name"] = name
+        return "detector"
+
+    monkeypatch.setattr(TransformersTokenDetector, "load", classmethod(fake_load))
+    assert cli.build_scorer(GroundingScorerType.TOKEN, "nli", None, "my/token-model") == "detector"
+    assert seen["name"] == "my/token-model"

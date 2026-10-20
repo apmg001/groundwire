@@ -142,6 +142,7 @@ than silently switching models mid-sentence.
 | `lexical` (default) | nothing | Invented numbers, amounts, dates, times and IDs; claims with little overlap with the context | Paraphrased contradictions ("did" vs "did not") |
 | `nli` | `make install-nli` | Semantic entailment and contradiction (DeBERTa cross-encoder) | Weak on exact numbers; tens of ms per claim on CPU |
 | `hybrid` | `make install-nli` | Both: a numeric gate rejects wrong numbers without running the model, NLI judges the rest | Slower than lexical |
+| `token` | `make install-nli` | Reads the whole prompt and answer at once and marks each answer word as supported or made up. Default model: [LettuceDetect](https://github.com/KRLabsOrg/LettuceDetect) (ModernBERT, MIT), fine-tuned on RAGTruth | Slowest; trained on RAG-style prompts, so other domains may need checking |
 
 Numbers are normalised before comparison (`1,200.00` = `1200`), and so are clock times (`5 pm` = `5:00 PM` = `17:0`).
 Scoring is CPU-bound, so it runs in a worker thread behind a concurrency limit and never blocks the event loop.
@@ -196,6 +197,15 @@ Answer score = average of the two weakest claims (`lowest_two`), threshold tuned
   passage, and structured-data answers needed a median of 334 model calls each.
   `--evidence-passages 3` (score each claim once against its 3 most relevant passages, joined) is
   built to fix both; its NLI results are pending.
+- **Evidence-first made NLI 10× faster but not more accurate.** On the same 300 answers,
+  `hybrid --evidence-passages 3` cut Data2txt latency from 13.5 s to 1.3 s per answer, but
+  ROC-AUC fell to 0.677 (Summary 0.448). The tuned thresholds (0.0009, then 0.012) show why:
+  this general-purpose model, trained on short sentence pairs, gives near-zero entailment to
+  almost every claim checked against long evidence, true or not. It is the wrong tool here.
+- **Next: a model trained for this exact task.** The `token` scorer runs LettuceDetect, which
+  was fine-tuned on the RAGTruth *train* split and reads all passages at once. Because it was
+  trained on train, its benchmark uses the model's native 0.5 threshold with no tuning
+  (`make bench-token`). Results pending.
 - **Still weak:** Data2txt (writing from structured business data) is barely better than chance.
   Correct answers paraphrase the data in words a lexical scorer can't match.
 
@@ -206,6 +216,7 @@ make bench            # lexical, full test set, about a minute
 make install-nli      # once: CPU-only torch + transformers
 make bench-nli        # NLI, 100 answers per task, evidence-first
 make bench-hybrid     # numeric gate + NLI, 100 answers per task, evidence-first
+make bench-token      # LettuceDetect token classifier, full test set (slow on CPU)
 
 # Tune for a "good answers blocked" budget instead of best F1
 python -m groundwire.evals --per-task 0 --dev-per-task 200 --max-good-blocked 0.2
@@ -272,7 +283,7 @@ src/groundwire/
   services/       ChatService: deadline, grounding policy, metrics
   routing/        Router: fallback chains, failover, streaming handoff
   resilience/     RetryPolicy, CircuitBreaker
-  guardrails/     text utils, scorers (lexical, NLI, hybrid), GroundingVerifier
+  guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   evals/          RAGTruth benchmark: loader, metrics, runner, report, CLI
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
@@ -293,7 +304,8 @@ scripts/          chaos demo
 - [x] Metrics, structured logs, Docker, CI
 - [ ] Semantic cache (embeddings + Redis/pgvector)
 - [ ] Prompt-injection detection and PII redaction
-- [ ] NLI and hybrid benchmark results
+- [x] NLI and hybrid benchmark results (negative result, documented)
+- [ ] Token-classifier (LettuceDetect) benchmark results
 - [ ] Eval harness with a CI regression gate
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas

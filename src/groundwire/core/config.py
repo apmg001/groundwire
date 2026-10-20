@@ -182,6 +182,7 @@ class GroundingScorerType(StrEnum):
     LEXICAL = "lexical"  # fast, dependency-free; checks content words and numbers
     NLI = "nli"  # transformer NLI model; needs the `nli` extra
     HYBRID = "hybrid"  # numeric gate + NLI; needs the `nli` extra
+    TOKEN = "token"  # noqa: S105 - fine-tuned token classifier (LettuceDetect), `nli` extra
 
 
 class GroundingFailurePolicy(StrEnum):
@@ -206,6 +207,8 @@ class GroundingConfig(_StrictModel):
     Attributes:
         scorer: Which scorer to use.
         nli_model: Hugging Face model id for the NLI scorer.
+        token_model: Hugging Face model id for the token scorer.
+        token_max_length: Maximum tokens (prompt + answer) for the token scorer.
         support_threshold: Per-claim score needed to count as supported.
         min_supported_ratio: Fraction of claims that must be supported for
             the answer to pass.
@@ -224,6 +227,8 @@ class GroundingConfig(_StrictModel):
 
     scorer: GroundingScorerType = GroundingScorerType.LEXICAL
     nli_model: str = "cross-encoder/nli-deberta-v3-small"
+    token_model: str = "KRLabsOrg/lettucedect-base-modernbert-en-v1"  # noqa: S105 - model id
+    token_max_length: Annotated[int, Field(ge=32, le=32_768)] = 4096
     support_threshold: Annotated[float, Field(ge=0, le=1)] = 0.6
     min_supported_ratio: Annotated[float, Field(ge=0, le=1)] = 0.8
     min_claim_tokens: Annotated[int, Field(ge=1, le=50)] = 3

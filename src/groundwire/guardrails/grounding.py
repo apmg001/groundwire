@@ -55,6 +55,14 @@ from groundwire.guardrails.scorers import (
     SupportScorer,
 )
 from groundwire.guardrails.text import chunk_passages, content_tokens, split_claims
+from groundwire.guardrails.token_detector import (
+    TokenDetector,
+    TransformersTokenDetector,
+    build_prompt,
+    max_prob_in_range,
+)
+
+Scorer = SupportScorer | TokenDetector
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +144,14 @@ class GroundingReport:
 class GroundingVerifier:
     """Checks answers against context using a pluggable scorer."""
 
-    def __init__(self, config: GroundingConfig, scorer: SupportScorer, *,
+    def __init__(self, config: GroundingConfig, scorer: Scorer, *,
                  max_concurrency: int = 2) -> None:
         """Create the verifier.
 
         Args:
             config: Thresholds and failure policy.
-            scorer: Support scorer.
+            scorer: Pairwise support scorer, or a token detector that reads the
+                whole prompt at once.
             max_concurrency: Max concurrent scoring jobs. Scorers are CPU-bound,
                 so running dozens at once only thrashes the CPU; excess requests
                 queue here instead.
@@ -168,12 +177,18 @@ class GroundingVerifier:
         return [c for c in split_claims(answer)
                 if len(content_tokens(c)) >= self._config.min_claim_tokens]
 
-    async def verify(self, answer: str, context: list[str]) -> GroundingReport:
+    async def verify(self, answer: str, context: list[str], *, question: str | None = None,
+                     prompt: str | None = None) -> GroundingReport:
         """Verify ``answer`` against ``context``.
 
         Args:
             answer: Model answer.
             context: Source passages supplied by the client.
+            question: The user's question (used by token detectors to build
+                their prompt; ignored by pairwise scorers).
+            prompt: Exact prompt the answer was generated from. Token detectors
+                use it verbatim instead of building one (benchmarks pass the
+                dataset's original prompt).
 
         Returns:
             The grounding report (``failed`` is a normal outcome, not an error).
@@ -191,6 +206,11 @@ class GroundingVerifier:
             return GroundingReport(verdict=Verdict.PASSED, scorer=self._scorer.name,
                                    aggregation=self._config.aggregation.value,
                                    latency_ms=_ms_since(started), truncated=truncated)
+        if isinstance(self._scorer, TokenDetector):
+            return await self._verify_with_tokens(
+                self._scorer, answer, claims,
+                prompt if prompt is not None else build_prompt(context, question),
+                started, truncated)
         if not passages:
             # Context contained no text: nothing can be supported.
             unsupported = [ClaimResult(c, 0.0, False, -1) for c in claims]
@@ -220,6 +240,50 @@ class GroundingVerifier:
                 row = scores[i * n:(i + 1) * n]
                 best = max(range(n), key=row.__getitem__)
                 results.append(ClaimResult(claim, row[best], row[best] >= threshold, best))
+        return self._report(results, started, truncated)
+
+    async def _verify_with_tokens(self, detector: TokenDetector, answer: str,
+                                  claims: list[str], prompt: str, started: float,
+                                  truncated: bool) -> GroundingReport:
+        """Score claims from per-token hallucination probabilities.
+
+        A claim's support is ``1 - max(token probability)`` over the answer
+        tokens inside it, so one confidently hallucinated word marks the claim.
+
+        Args:
+            detector: Token detector.
+            answer: Model answer.
+            claims: Claims extracted from the answer.
+            prompt: Prompt given to the detector.
+            started: ``perf_counter`` at the start of verification.
+            truncated: Whether claims/passages were capped.
+
+        Returns:
+            The report.
+
+        Raises:
+            GuardrailUnavailableError: If detection fails and policy is fail-closed.
+        """
+        try:
+            async with self._limit:
+                tokens = await asyncio.to_thread(detector.detect, prompt, answer)
+        except GuardrailUnavailableError as exc:
+            return self._on_scorer_failure(exc, started)
+        except Exception as exc:  # noqa: BLE001 - any detector crash is a guardrail outage
+            return self._on_scorer_failure(GuardrailUnavailableError(str(exc)), started)
+
+        threshold = self._config.support_threshold
+        results: list[ClaimResult] = []
+        cursor = 0
+        for claim in claims:
+            start = answer.find(claim, cursor)
+            if start < 0:  # should not happen; fall back to the whole answer (conservative)
+                start, end = 0, len(answer)
+            else:
+                end = start + len(claim)
+                cursor = end
+            score = 1.0 - max_prob_in_range(tokens, start, end)
+            results.append(ClaimResult(claim, score, score >= threshold, -1))
         return self._report(results, started, truncated)
 
     def _build_pairs(self, claims: list[str], passages: list[str]
@@ -310,21 +374,24 @@ def _ms_since(started: float) -> float:
     return (time.perf_counter() - started) * 1000
 
 
-def build_scorer(config: GroundingConfig) -> SupportScorer:
-    """Build the configured support scorer.
+def build_scorer(config: GroundingConfig) -> Scorer:
+    """Build the configured scorer.
 
     Args:
         config: Grounding configuration.
 
     Returns:
-        The scorer.
+        A pairwise support scorer or a token detector.
 
     Raises:
-        ConfigurationError: If an NLI-based scorer is selected but the model
+        ConfigurationError: If a model-based scorer is selected but the model
             or the ``nli`` extra is unavailable.
     """
     if config.scorer is GroundingScorerType.LEXICAL:
         return LexicalScorer()
+    if config.scorer is GroundingScorerType.TOKEN:
+        return TransformersTokenDetector.load(config.token_model,
+                                              max_length=config.token_max_length)
     nli = NLIScorer.load(config.nli_model)
     if config.scorer is GroundingScorerType.HYBRID:
         return HybridScorer(nli)

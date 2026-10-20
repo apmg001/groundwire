@@ -131,7 +131,8 @@ class ChatService:
             }
             grounding = request.groundwire.grounding if request.groundwire else None
             if grounding is not None:
-                report = await self._check_grounding(routed.completion.text, grounding)
+                report = await self._check_grounding(routed.completion.text, grounding,
+                                                     _last_user_message(request))
                 meta["grounding"] = report.as_dict()
 
             status = "success"
@@ -233,7 +234,8 @@ class ChatService:
                 yield chunk.model_dump(exclude_none=True)
 
             if grounding is not None:
-                report = await self._check_grounding("".join(parts), grounding)
+                report = await self._check_grounding("".join(parts), grounding,
+                                                     _last_user_message(request))
                 yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
                        "model": request.model, "choices": [],
                        "groundwire": {"route": route, "provider": provider,
@@ -259,12 +261,14 @@ class ChatService:
     # Helpers
     # ------------------------------------------------------------------ #
 
-    async def _check_grounding(self, answer: str, options: GroundingOptions) -> GroundingReport:
+    async def _check_grounding(self, answer: str, options: GroundingOptions,
+                               question: str | None = None) -> GroundingReport:
         """Run grounding and apply the request's policy.
 
         Args:
             answer: Generated text.
             options: Grounding options.
+            question: The user's question, for scorers that read the full prompt.
 
         Returns:
             The report (when the answer passes, or fails in ``flag`` mode).
@@ -273,7 +277,7 @@ class ChatService:
             GroundingViolationError: Failed in ``block`` mode.
             GuardrailUnavailableError: Scorer failed and policy is fail-closed.
         """
-        report = await self._verifier.verify(answer, options.context)
+        report = await self._verifier.verify(answer, options.context, question=question)
         self._metrics.grounding.labels(verdict=report.verdict.value).inc()
         self._metrics.grounding_latency.observe(report.latency_ms / 1000)
         logger.info("grounding checked", extra={
@@ -294,3 +298,18 @@ class ChatService:
                                       stream=stream_label).inc()
         self._metrics.request_latency.labels(route=route, stream=stream_label).observe(
             time.perf_counter() - started)
+
+
+def _last_user_message(request: ChatCompletionRequest) -> str | None:
+    """Return the most recent user message, used as the question for grounding.
+
+    Args:
+        request: Client request.
+
+    Returns:
+        The message text, or ``None`` if the conversation has no user turn.
+    """
+    for message in reversed(request.messages):
+        if message.role == "user":
+            return message.content
+    return None

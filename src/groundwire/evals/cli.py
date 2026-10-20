@@ -41,8 +41,9 @@ from groundwire.evals.datasets import RAGTRUTH_TASKS, LabelPolicy, load_ragtruth
 from groundwire.evals.metrics import best_f1_threshold, threshold_for_block_budget
 from groundwire.evals.report import build_summary, render_markdown
 from groundwire.evals.runner import ExampleResult, evaluate
-from groundwire.guardrails.grounding import GroundingVerifier
-from groundwire.guardrails.scorers import HybridScorer, LexicalScorer, NLIScorer, SupportScorer
+from groundwire.guardrails.grounding import GroundingVerifier, Scorer
+from groundwire.guardrails.scorers import HybridScorer, LexicalScorer, NLIScorer
+from groundwire.guardrails.token_detector import DEFAULT_TOKEN_MODEL, TransformersTokenDetector
 
 logger = logging.getLogger("groundwire.evals")
 
@@ -69,6 +70,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         default=GroundingScorerType.LEXICAL.value)
     parser.add_argument("--nli-model", default=DEFAULT_NLI_MODEL,
                         help=f"Hugging Face NLI model (default: {DEFAULT_NLI_MODEL})")
+    parser.add_argument("--token-model", default=DEFAULT_TOKEN_MODEL,
+                        help=f"token-classifier model for --scorer token "
+                             f"(default: {DEFAULT_TOKEN_MODEL})")
     parser.add_argument("--per-task", type=int, default=100,
                         help="test responses per task; 0 = all (default: 100)")
     parser.add_argument("--dev-per-task", type=int, default=50,
@@ -117,14 +121,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def build_scorer(kind: GroundingScorerType, nli_model: str,
-                 threads: int | None) -> SupportScorer:
+def build_scorer(kind: GroundingScorerType, nli_model: str, threads: int | None,
+                 token_model: str = DEFAULT_TOKEN_MODEL) -> Scorer:
     """Instantiate the requested scorer.
 
     Args:
         kind: Scorer type.
-        nli_model: NLI model id (ignored for lexical).
-        threads: CPU threads for NLI.
+        nli_model: NLI model id (used by nli/hybrid).
+        threads: CPU threads for model-based scorers.
+        token_model: Token-classifier model id (used by token).
 
     Returns:
         The scorer.
@@ -134,6 +139,8 @@ def build_scorer(kind: GroundingScorerType, nli_model: str,
     """
     if kind is GroundingScorerType.LEXICAL:
         return LexicalScorer()
+    if kind is GroundingScorerType.TOKEN:
+        return TransformersTokenDetector.load(token_model, num_threads=threads)
     nli = NLIScorer.load(nli_model, num_threads=threads)
     return HybridScorer(nli) if kind is GroundingScorerType.HYBRID else nli
 
@@ -174,7 +181,7 @@ async def run(args: argparse.Namespace) -> Path:
     """
     kind = GroundingScorerType(args.scorer)
     policy = LabelPolicy(args.label_policy)
-    scorer = build_scorer(kind, args.nli_model, args.threads)
+    scorer = build_scorer(kind, args.nli_model, args.threads, args.token_model)
     config = GroundingConfig(scorer=kind, min_claim_tokens=args.min_claim_tokens,
                              aggregation=AnswerAggregation(args.aggregation),
                              evidence_passages=args.evidence_passages,
@@ -210,7 +217,8 @@ async def run(args: argparse.Namespace) -> Path:
     now = datetime.now(tz=UTC)
     run_info = {
         "dataset": "RAGTruth", "split": "test", "scorer": kind.value,
-        "nli_model": args.nli_model if kind is not GroundingScorerType.LEXICAL else None,
+        "nli_model": (args.token_model if kind is GroundingScorerType.TOKEN
+                      else args.nli_model if kind is not GroundingScorerType.LEXICAL else None),
         "per_task": args.per_task, "dev_per_task": args.dev_per_task, "seed": args.seed,
         "label_policy": policy.value, "min_claim_tokens": args.min_claim_tokens,
         "aggregation": args.aggregation, "evidence_passages": args.evidence_passages,
