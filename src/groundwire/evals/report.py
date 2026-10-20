@@ -82,6 +82,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"- **Test set:** {run['split']} split, {summary['overall']['n']} responses "
         f"({run['per_task'] or 'all'} per task, seed {run['seed']})",
         f"- **Label policy:** `{run['label_policy']}`",
+        f"- **Answer score:** `{run.get('aggregation', 'min')}` of claim scores; "
+        f"evidence passages per claim: {run.get('evidence_passages', 0) or 'all, separately'}",
         f"- **Threshold:** {summary['threshold']} ({run['threshold_source']})",
         f"- **Run date:** {run['date']}",
         "",

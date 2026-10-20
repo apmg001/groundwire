@@ -24,6 +24,7 @@ from groundwire.evals.metrics import (
     confusion,
     percentile,
     roc_auc,
+    threshold_for_block_budget,
 )
 from groundwire.evals.report import build_summary, render_markdown, summarise
 from groundwire.evals.runner import ExampleResult, evaluate
@@ -218,6 +219,24 @@ def test_roc_auc(scores: list[float], actual: list[bool], expected: float) -> No
     assert roc_auc(scores, actual) == pytest.approx(expected)
 
 
+def test_block_budget_threshold() -> None:
+    scores = [0.05, 0.1, 0.2, 0.3, 0.6, 0.7, 0.8, 0.9]
+    actual = [True, True, False, True, False, False, False, True]
+    threshold, recall = threshold_for_block_budget(scores, actual, 0.25)
+    m = at_threshold(scores, actual, threshold)
+    assert m.false_block_rate <= 0.25
+    assert recall == m.recall == 0.75  # catches 3 of 4 while blocking 1 of 4 good answers
+
+
+def test_block_budget_zero_and_errors() -> None:
+    threshold, recall = threshold_for_block_budget([0.1, 0.2], [False, True], 0.0)
+    assert (threshold, recall) == (0.0, 0.0)  # cannot catch anything without blocking good
+    with pytest.raises(ValueError):
+        threshold_for_block_budget([0.1], [True], 1.5)
+    with pytest.raises(ValueError):
+        threshold_for_block_budget([], [], 0.1)
+
+
 def test_roc_auc_single_class() -> None:
     assert roc_auc([0.1, 0.2], [True, True]) is None
 
@@ -310,6 +329,21 @@ def test_cli_fixed_threshold(ragtruth_dir: Path, tmp_path: Path) -> None:
     assert code == 0
 
 
+def test_cli_block_budget_and_evidence(ragtruth_dir: Path, tmp_path: Path) -> None:
+    out = tmp_path / "o"
+    code = main(["--data-dir", str(ragtruth_dir), "--per-task", "0", "--dev-per-task", "2",
+                 "--max-good-blocked", "0.2", "--evidence-passages", "2",
+                 "--aggregation", "min", "--out-dir", str(out)])
+    assert code == 0
+    [run_dir] = list(out.iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["run"]["aggregation"] == "min"
+    assert summary["run"]["evidence_passages"] == 2
+    assert "block at most 20%" in summary["run"]["threshold_source"]
+    first = json.loads((run_dir / "predictions.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert isinstance(first["claim_scores"], list)
+
+
 def test_cli_missing_data_returns_1(tmp_path: Path) -> None:
     assert main(["--data-dir", str(tmp_path / "nope"), "--out-dir", str(tmp_path)]) == 1
 
@@ -318,6 +352,10 @@ def test_cli_missing_data_returns_1(tmp_path: Path) -> None:
     ["--threshold", "1.5", "--dev-per-task", "0"],
     ["--threshold", "0.5"],  # conflicts with default tuning
     ["--per-task", "-1"],
+    ["--evidence-passages", "11"],
+    ["--max-good-blocked", "2"],
+    ["--max-good-blocked", "0.2", "--dev-per-task", "0"],
+    ["--aggregation", "ratio"],
 ])
 def test_cli_argument_validation(argv: list[str]) -> None:
     with pytest.raises(SystemExit):

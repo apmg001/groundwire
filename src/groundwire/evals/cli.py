@@ -30,6 +30,7 @@ from typing import Any
 
 from groundwire import __version__
 from groundwire.core.config import (
+    AnswerAggregation,
     GroundingConfig,
     GroundingFailurePolicy,
     GroundingScorerType,
@@ -37,7 +38,7 @@ from groundwire.core.config import (
 from groundwire.core.errors import ConfigurationError, DatasetError
 from groundwire.core.logging import configure_logging
 from groundwire.evals.datasets import RAGTRUTH_TASKS, LabelPolicy, load_ragtruth
-from groundwire.evals.metrics import best_f1_threshold
+from groundwire.evals.metrics import best_f1_threshold, threshold_for_block_budget
 from groundwire.evals.report import build_summary, render_markdown
 from groundwire.evals.runner import ExampleResult, evaluate
 from groundwire.guardrails.grounding import GroundingVerifier
@@ -76,10 +77,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=None,
                         help=f"fixed decision threshold (default when not tuning: "
                              f"{DEFAULT_THRESHOLD})")
+    parser.add_argument("--max-good-blocked", type=float, default=None,
+                        help="tune the threshold to catch the most hallucinations while "
+                             "blocking at most this fraction of good answers on the train "
+                             "split, e.g. 0.2 (default: tune for best F1)")
     parser.add_argument("--tasks", nargs="+", choices=RAGTRUTH_TASKS, default=list(RAGTRUTH_TASKS))
     parser.add_argument("--label-policy", choices=[p.value for p in LabelPolicy],
                         default=LabelPolicy.STRICT.value)
     parser.add_argument("--min-claim-tokens", type=int, default=3)
+    parser.add_argument("--aggregation", default=AnswerAggregation.LOWEST_TWO.value,
+                        choices=[a.value for a in AnswerAggregation
+                                 if a is not AnswerAggregation.RATIO],
+                        help="how claim scores combine into an answer score "
+                             "(default: lowest_two, selected on the train split)")
+    parser.add_argument("--evidence-passages", type=int, default=0,
+                        help="0 = score each passage separately; k > 0 = join the k "
+                             "most relevant passages per claim (recommended: 3 for NLI)")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--threads", type=int, default=None,
                         help="CPU threads for the NLI model (default: torch decides)")
@@ -89,6 +102,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.per_task < 0 or args.dev_per_task < 0:
         parser.error("--per-task and --dev-per-task must be >= 0")
+    if args.max_good_blocked is not None:
+        if not 0 <= args.max_good_blocked <= 1:
+            parser.error("--max-good-blocked must be in [0, 1]")
+        if not args.dev_per_task:
+            parser.error("--max-good-blocked needs --dev-per-task > 0 to tune on")
+    if not 0 <= args.evidence_passages <= 10:
+        parser.error("--evidence-passages must be between 0 and 10")
     if args.threshold is not None and not 0 <= args.threshold <= 1:
         parser.error("--threshold must be in [0, 1]")
     if args.threshold is not None and args.dev_per_task:
@@ -156,7 +176,8 @@ async def run(args: argparse.Namespace) -> Path:
     policy = LabelPolicy(args.label_policy)
     scorer = build_scorer(kind, args.nli_model, args.threads)
     config = GroundingConfig(scorer=kind, min_claim_tokens=args.min_claim_tokens,
-                             min_supported_ratio=1.0,
+                             aggregation=AnswerAggregation(args.aggregation),
+                             evidence_passages=args.evidence_passages,
                              on_error=GroundingFailurePolicy.FAIL_OPEN)
     verifier = GroundingVerifier(config, scorer, max_concurrency=1)
 
@@ -165,10 +186,18 @@ async def run(args: argparse.Namespace) -> Path:
         dev = load_ragtruth(args.data_dir, split="train", tasks=args.tasks,
                             per_task=args.dev_per_task, seed=args.seed, label_policy=policy)
         dev_results = await evaluate(verifier, dev)
-        threshold, dev_f1 = best_f1_threshold([r.support_score for r in dev_results],
-                                              [r.is_hallucinated for r in dev_results])
-        threshold_source = (f"tuned for best F1 on {len(dev)} train responses; "
-                            f"train F1 {dev_f1:.3f}")
+        dev_scores = [r.support_score for r in dev_results]
+        dev_labels = [r.is_hallucinated for r in dev_results]
+        if args.max_good_blocked is not None:
+            threshold, dev_recall = threshold_for_block_budget(
+                dev_scores, dev_labels, args.max_good_blocked)
+            threshold_source = (f"tuned on {len(dev)} train responses to block at most "
+                                f"{args.max_good_blocked:.0%} of good answers; "
+                                f"train recall {dev_recall:.3f}")
+        else:
+            threshold, dev_f1 = best_f1_threshold(dev_scores, dev_labels)
+            threshold_source = (f"tuned for best F1 on {len(dev)} train responses; "
+                                f"train F1 {dev_f1:.3f}")
     else:
         threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
         threshold_source = "fixed"
@@ -184,6 +213,7 @@ async def run(args: argparse.Namespace) -> Path:
         "nli_model": args.nli_model if kind is not GroundingScorerType.LEXICAL else None,
         "per_task": args.per_task, "dev_per_task": args.dev_per_task, "seed": args.seed,
         "label_policy": policy.value, "min_claim_tokens": args.min_claim_tokens,
+        "aggregation": args.aggregation, "evidence_passages": args.evidence_passages,
         "threshold_source": threshold_source, "groundwire_version": __version__,
         "date": now.strftime("%Y-%m-%d"),
     }

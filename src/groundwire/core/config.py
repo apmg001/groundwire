@@ -191,6 +191,15 @@ class GroundingFailurePolicy(StrEnum):
     FAIL_CLOSED = "fail_closed"  # refuse the request with 503
 
 
+class AnswerAggregation(StrEnum):
+    """How per-claim support scores combine into one verdict for the answer."""
+
+    RATIO = "ratio"  # pass if >= min_supported_ratio of claims meet support_threshold
+    MIN = "min"  # score = weakest claim
+    LOWEST_TWO = "lowest_two"  # score = mean of the two weakest claims
+    MEAN = "mean"  # score = mean of all claims
+
+
 class GroundingConfig(_StrictModel):
     """Grounding-verification settings.
 
@@ -202,6 +211,14 @@ class GroundingConfig(_StrictModel):
             the answer to pass.
         min_claim_tokens: Sentences with fewer content tokens are not
             treated as factual claims (e.g. "Sure!").
+        aggregation: How claim scores become an answer verdict. ``ratio`` uses
+            ``min_supported_ratio``; the score-based modes compare the
+            aggregated score with ``support_threshold``.
+        evidence_passages: 0 scores each claim against every passage
+            separately (best one wins). ``k > 0`` first picks the ``k`` passages
+            sharing the most words with the claim and scores the claim once
+            against them joined together: far fewer model calls, and claims
+            that combine facts from several passages can be supported.
         on_error: Policy when the scorer fails.
     """
 
@@ -210,6 +227,8 @@ class GroundingConfig(_StrictModel):
     support_threshold: Annotated[float, Field(ge=0, le=1)] = 0.6
     min_supported_ratio: Annotated[float, Field(ge=0, le=1)] = 0.8
     min_claim_tokens: Annotated[int, Field(ge=1, le=50)] = 3
+    aggregation: AnswerAggregation = AnswerAggregation.RATIO
+    evidence_passages: Annotated[int, Field(ge=0, le=10)] = 0
     on_error: GroundingFailurePolicy = GroundingFailurePolicy.FAIL_OPEN
 
 

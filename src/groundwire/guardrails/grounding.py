@@ -6,9 +6,23 @@ Algorithm:
 2. Drop non-claims: sentences with fewer than ``min_claim_tokens`` content
    words ("Sure!", "Here you go:").
 3. Split the context into passages small enough for the scorer.
-4. Score every (passage, claim) pair; a claim's support is its best passage.
+4. Score each claim's support:
+
+   * ``evidence_passages = 0``: score every (passage, claim) pair; the claim's
+     support is its best passage.
+   * ``evidence_passages = k``: pick the ``k`` passages that share the most
+     words with the claim, join them, and score the claim once against them.
+
 5. A claim is *supported* if support >= ``support_threshold``.
-6. The answer *passes* if supported_claims / claims >= ``min_supported_ratio``.
+6. Combine claims into a verdict (``aggregation``):
+
+   * ``ratio``: pass if supported_claims / claims >= ``min_supported_ratio``,
+   * ``min`` / ``lowest_two`` / ``mean``: aggregate the claim scores into one
+     answer score and pass if it is >= ``support_threshold``.
+
+   ``lowest_two`` was selected on the RAGTruth *train* split: judging only
+   the single weakest claim over-penalises long answers, while a plain mean
+   lets one invented fact hide among many correct ones.
 
 An answer with no checkable claims passes trivially (nothing to contradict).
 
@@ -27,7 +41,12 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from groundwire.core.config import GroundingConfig, GroundingFailurePolicy, GroundingScorerType
+from groundwire.core.config import (
+    AnswerAggregation,
+    GroundingConfig,
+    GroundingFailurePolicy,
+    GroundingScorerType,
+)
 from groundwire.core.errors import GuardrailUnavailableError
 from groundwire.guardrails.scorers import (
     HybridScorer,
@@ -77,6 +96,9 @@ class GroundingReport:
         verdict: Overall verdict.
         scorer: Scorer used.
         supported_ratio: Supported claims / checked claims.
+        answer_score: Claim scores combined by the configured aggregation
+            (for ``ratio`` mode this equals ``supported_ratio``).
+        aggregation: Aggregation used.
         claims: Per-claim results.
         latency_ms: Time spent verifying.
         truncated: True if claims/passages were capped.
@@ -86,6 +108,8 @@ class GroundingReport:
     verdict: Verdict
     scorer: str
     supported_ratio: float = 1.0
+    answer_score: float = 1.0
+    aggregation: str = AnswerAggregation.RATIO.value
     claims: list[ClaimResult] = field(default_factory=list)
     latency_ms: float = 0.0
     truncated: bool = False
@@ -104,6 +128,7 @@ class GroundingReport:
             {**asdict(c), "score": round(c.score, 4)} for c in self.claims
         ]
         data["supported_ratio"] = round(self.supported_ratio, 4)
+        data["answer_score"] = round(self.answer_score, 4)
         data["latency_ms"] = round(self.latency_ms, 2)
         return data
 
@@ -164,13 +189,14 @@ class GroundingVerifier:
 
         if not claims:
             return GroundingReport(verdict=Verdict.PASSED, scorer=self._scorer.name,
+                                   aggregation=self._config.aggregation.value,
                                    latency_ms=_ms_since(started), truncated=truncated)
         if not passages:
             # Context contained no text: nothing can be supported.
             unsupported = [ClaimResult(c, 0.0, False, -1) for c in claims]
             return self._report(unsupported, started, truncated)
 
-        pairs = [(p, c) for c in claims for p in passages]
+        pairs, best_index = self._build_pairs(claims, passages)
         try:
             async with self._limit:
                 scores = await asyncio.to_thread(self._scorer.score_batch, pairs)
@@ -183,23 +209,64 @@ class GroundingVerifier:
             return self._on_scorer_failure(
                 GuardrailUnavailableError("scorer returned wrong number of scores"), started)
 
-        n = len(passages)
+        threshold = self._config.support_threshold
         results: list[ClaimResult] = []
-        for i, claim in enumerate(claims):
-            row = scores[i * n:(i + 1) * n]
-            best = max(range(n), key=row.__getitem__)
-            results.append(ClaimResult(claim, row[best],
-                                       row[best] >= self._config.support_threshold, best))
+        if best_index is not None:  # evidence-first: one pair per claim
+            for claim, score, best in zip(claims, scores, best_index, strict=True):
+                results.append(ClaimResult(claim, score, score >= threshold, best))
+        else:  # all pairs: best passage wins
+            n = len(passages)
+            for i, claim in enumerate(claims):
+                row = scores[i * n:(i + 1) * n]
+                best = max(range(n), key=row.__getitem__)
+                results.append(ClaimResult(claim, row[best], row[best] >= threshold, best))
         return self._report(results, started, truncated)
+
+    def _build_pairs(self, claims: list[str], passages: list[str]
+                     ) -> tuple[list[tuple[str, str]], list[int] | None]:
+        """Build the (premise, claim) pairs to score.
+
+        Args:
+            claims: Claims to check.
+            passages: Context passages.
+
+        Returns:
+            ``(pairs, best_index)``. In all-pairs mode ``best_index`` is
+            ``None``; in evidence-first mode it holds, per claim, the index of
+            the passage that shared the most words with it.
+        """
+        k = self._config.evidence_passages
+        if k == 0:
+            return [(p, c) for c in claims for p in passages], None
+
+        passage_tokens = [content_tokens(p) for p in passages]
+        pairs: list[tuple[str, str]] = []
+        best_index: list[int] = []
+        for claim in claims:
+            claim_tokens = content_tokens(claim)
+            ranked = sorted(range(len(passages)),
+                            key=lambda i: (-len(claim_tokens & passage_tokens[i]), i))[:k]
+            # Keep document order so the joined evidence still reads naturally.
+            premise = " ".join(passages[i] for i in sorted(ranked))
+            pairs.append((premise, claim))
+            best_index.append(ranked[0])
+        return pairs, best_index
 
     def _report(self, results: list[ClaimResult], started: float,
                 truncated: bool) -> GroundingReport:
         ratio = sum(r.supported for r in results) / len(results)
-        verdict = (Verdict.PASSED if ratio >= self._config.min_supported_ratio
-                   else Verdict.FAILED)
-        return GroundingReport(verdict=verdict, scorer=self._scorer.name,
-                               supported_ratio=ratio, claims=results,
-                               latency_ms=_ms_since(started), truncated=truncated)
+        aggregation = self._config.aggregation
+        if aggregation is AnswerAggregation.RATIO:
+            answer_score = ratio
+            passed = ratio >= self._config.min_supported_ratio
+        else:
+            answer_score = aggregate([r.score for r in results], aggregation)
+            passed = answer_score >= self._config.support_threshold
+        return GroundingReport(verdict=Verdict.PASSED if passed else Verdict.FAILED,
+                               scorer=self._scorer.name, supported_ratio=ratio,
+                               answer_score=answer_score, aggregation=aggregation.value,
+                               claims=results, latency_ms=_ms_since(started),
+                               truncated=truncated)
 
     def _on_scorer_failure(self, exc: GuardrailUnavailableError,
                            started: float) -> GroundingReport:
@@ -209,8 +276,34 @@ class GroundingVerifier:
         if self._config.on_error is GroundingFailurePolicy.FAIL_CLOSED:
             raise exc
         return GroundingReport(verdict=Verdict.UNVERIFIED, scorer=self._scorer.name,
-                               supported_ratio=0.0, latency_ms=_ms_since(started),
-                               error=exc.message)
+                               supported_ratio=0.0, answer_score=0.0,
+                               aggregation=self._config.aggregation.value,
+                               latency_ms=_ms_since(started), error=exc.message)
+
+
+def aggregate(scores: list[float], aggregation: AnswerAggregation) -> float:
+    """Combine claim scores into one answer score.
+
+    Args:
+        scores: Per-claim support scores (non-empty).
+        aggregation: A score-based aggregation (not ``ratio``).
+
+    Returns:
+        The answer score in [0, 1].
+
+    Raises:
+        ValueError: If ``scores`` is empty or ``aggregation`` is ``ratio``.
+    """
+    if not scores:
+        raise ValueError("cannot aggregate an empty list of scores")
+    if aggregation is AnswerAggregation.MIN:
+        return min(scores)
+    if aggregation is AnswerAggregation.LOWEST_TWO:
+        weakest = sorted(scores)[:2]
+        return sum(weakest) / len(weakest)
+    if aggregation is AnswerAggregation.MEAN:
+        return sum(scores) / len(scores)
+    raise ValueError("'ratio' is threshold-based and has no single answer score")
 
 
 def _ms_since(started: float) -> float:

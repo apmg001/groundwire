@@ -6,9 +6,9 @@ from collections.abc import Sequence
 
 import pytest
 
-from groundwire.core.config import GroundingConfig, GroundingFailurePolicy
+from groundwire.core.config import AnswerAggregation, GroundingConfig, GroundingFailurePolicy
 from groundwire.core.errors import GuardrailUnavailableError
-from groundwire.guardrails.grounding import GroundingVerifier, Verdict
+from groundwire.guardrails.grounding import GroundingVerifier, Verdict, aggregate
 from groundwire.guardrails.scorers import LexicalScorer, NLIScorer, Pair, SupportScorer
 from groundwire.guardrails.text import chunk_passages, content_tokens, numbers, split_claims
 
@@ -164,3 +164,65 @@ def test_lexical_accepts_same_time_in_different_formats() -> None:
     assert LexicalScorer().score(passage, "It is open from 11 am to 5 pm on Monday.") > 0.0
     # A genuinely different opening time is still rejected outright.
     assert LexicalScorer().score(passage, "It is open from 9 am to 5 pm on Monday.") == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Aggregation and evidence-first pairing
+# --------------------------------------------------------------------------- #
+
+
+
+@pytest.mark.parametrize(("aggregation", "expected"), [
+    (AnswerAggregation.MIN, 0.1),
+    (AnswerAggregation.LOWEST_TWO, 0.3),
+    (AnswerAggregation.MEAN, 0.6),
+])
+def test_aggregate(aggregation: AnswerAggregation, expected: float) -> None:
+    assert aggregate([0.9, 0.1, 0.5, 0.9], aggregation) == pytest.approx(expected)
+
+
+def test_aggregate_single_claim_and_errors() -> None:
+    assert aggregate([0.4], AnswerAggregation.LOWEST_TWO) == 0.4
+    with pytest.raises(ValueError):
+        aggregate([], AnswerAggregation.MIN)
+    with pytest.raises(ValueError):
+        aggregate([0.5], AnswerAggregation.RATIO)
+
+
+async def test_score_based_verdict_uses_support_threshold() -> None:
+    answer = ("Invoice INV-1042 was issued to Acme Corp. The total amount due is 1,200 USD. "
+              "Acme Corp also qualifies for a loyalty discount programme.")
+    lenient = _verifier(aggregation=AnswerAggregation.MEAN, support_threshold=0.5)
+    strict = _verifier(aggregation=AnswerAggregation.MIN, support_threshold=0.5)
+    mean_report = await lenient.verify(answer, CONTEXT)
+    min_report = await strict.verify(answer, CONTEXT)
+    assert mean_report.aggregation == "mean"
+    assert mean_report.verdict is Verdict.PASSED  # one weak claim averaged away
+    assert min_report.verdict is Verdict.FAILED  # weakest claim decides
+    assert min_report.answer_score == min(c.score for c in min_report.claims)
+    assert min_report.as_dict()["answer_score"] == round(min_report.answer_score, 4)
+
+
+class _CountingScorer(LexicalScorer):
+    def __init__(self) -> None:
+        self.pairs: list[tuple[str, str]] = []
+
+    def score_batch(self, pairs: Sequence[Pair]) -> list[float]:
+        self.pairs.extend(pairs)
+        return super().score_batch(pairs)
+
+
+async def test_evidence_first_scores_each_claim_once_against_joined_passages() -> None:
+    context = ["The museum opened in 1960.", "Unrelated text about weather in Spain.",
+               "It holds 4,000 paintings by local artists."]
+    answer = "The museum opened in 1960 and holds 4,000 paintings."
+    all_pairs, evidence = _CountingScorer(), _CountingScorer()
+    await _verifier(all_pairs).verify(answer, context)
+    report = await _verifier(evidence, evidence_passages=2).verify(answer, context)
+
+    assert len(evidence.pairs) == 1  # one premise per claim instead of one per passage
+    premise, _ = evidence.pairs[0]
+    assert "1960" in premise and "4,000" in premise and "weather" not in premise
+    # Facts spread over two passages: only the joined evidence supports the claim.
+    assert report.claims[0].score == 1.0
+    assert max(LexicalScorer().score(p, answer) for p, _ in all_pairs.pairs) == 0.0

@@ -153,6 +153,41 @@ def best_f1_threshold(scores: Sequence[float], actual: Sequence[bool]) -> tuple[
     return best_threshold, best_f1
 
 
+def threshold_for_block_budget(scores: Sequence[float], actual: Sequence[bool],
+                               max_false_block_rate: float) -> tuple[float, float]:
+    """Find the threshold that catches the most hallucinations within a budget.
+
+    Product teams usually reason this way: "we can tolerate blocking at most
+    X% of good answers; catch as many hallucinations as possible within that."
+
+    Args:
+        scores: Support scores.
+        actual: Ground-truth flags.
+        max_false_block_rate: Maximum fraction of grounded answers that may be
+            flagged, in [0, 1].
+
+    Returns:
+        ``(threshold, recall)``. A threshold of ``0.0`` (flag nothing) is
+        returned if no positive threshold fits the budget.
+
+    Raises:
+        ValueError: If inputs are empty, mismatched, or the budget is invalid.
+    """
+    if not scores or len(scores) != len(actual):
+        raise ValueError("scores must be non-empty and match actual in length")
+    if not 0 <= max_false_block_rate <= 1:
+        raise ValueError("max_false_block_rate must be in [0, 1]")
+    distinct = sorted(set(scores))
+    candidates = [distinct[0]] + [(a + b) / 2 for a, b in pairwise(distinct)]
+    candidates.append(distinct[-1] + 1e-9)
+    best_threshold, best_recall = 0.0, 0.0
+    for threshold in candidates:
+        metrics = at_threshold(scores, actual, threshold)
+        if metrics.false_block_rate <= max_false_block_rate and metrics.recall > best_recall:
+            best_threshold, best_recall = threshold, metrics.recall
+    return best_threshold, best_recall
+
+
 def roc_auc(scores: Sequence[float], actual: Sequence[bool]) -> float | None:
     """Probability a random hallucinated response scores lower than a grounded one.
 

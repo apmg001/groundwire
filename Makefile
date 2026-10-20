@@ -47,7 +47,7 @@ bench: bench-data ## Lexical scorer on the full RAGTruth test set (~1 minute, no
 	python -m groundwire.evals --scorer lexical --per-task 0 --dev-per-task 200
 
 bench-nli: bench-data  ## NLI scorer on 100 test responses per task (needs make install-nli)
-	python -m groundwire.evals --scorer nli --per-task 100 --dev-per-task 50
+	python -m groundwire.evals --scorer nli --per-task 100 --dev-per-task 50 --evidence-passages 3
 
 bench-hybrid: bench-data  ## Numeric gate + NLI (needs make install-nli)
-	python -m groundwire.evals --scorer hybrid --per-task 100 --dev-per-task 50
+	python -m groundwire.evals --scorer hybrid --per-task 100 --dev-per-task 50 --evidence-passages 3

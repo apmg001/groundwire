@@ -156,33 +156,59 @@ business data), each labelled by human annotators as hallucinated or not.
 
 The benchmark runs the **same verifier the gateway uses**. The decision threshold is tuned on the
 *train* split and applied unchanged to the *test* split, so the numbers are not tuned on the data
-they report. A response counts as flagged if any of its claims scores below the threshold.
+they report. A response is flagged when its answer score (claim scores combined by the configured aggregation) falls below the threshold.
 
-### Lexical scorer (default, no ML model), full test set
+### Results: lexical scorer (no ML model), full test set
+
+Answer score = average of the two weakest claims (`lowest_two`), threshold tuned for best F1 on train:
 
 | Task | Responses | Hallucinated | Precision | Recall | F1 | F1 if flagging everything | ROC-AUC | Good answers blocked | Latency p50 |
 |---|---|---|---|---|---|---|---|---|---|
-| **All tasks** | 2700 | 34.9% | 54.2% | 76.7% | **63.5%** | 51.8% | **0.735** | 34.8% | 3 ms |
-| QA | 900 | 17.8% | 39.9% | 54.4% | 46.0% | 30.2% | 0.769 | 17.7% | 1 ms |
-| Summary | 900 | 22.7% | 31.7% | 48.0% | 38.2% | 37.0% | 0.635 | 30.3% | 2 ms |
-| Data2txt | 900 | 64.3% | 66.6% | 92.9% | 77.6% | 78.3% | 0.583 | 84.1% | 9 ms |
+| **All tasks** | 2700 | 34.9% | 52.8% | 82.6% | **64.4%** | 51.8% | **0.783** | 39.7% | 3 ms |
+| QA | 900 | 17.8% | 35.8% | 61.3% | 45.2% | 30.2% | 0.785 | 23.8% | 2 ms |
+| Summary | 900 | 22.7% | 33.9% | 51.5% | 40.9% | 37.0% | 0.667 | 29.4% | 3 ms |
+| Data2txt | 900 | 64.3% | 64.6% | 99.5% | 78.3% | 78.3% | 0.592 | 98.4% | 11 ms |
 
-**What this shows, honestly:**
+**Choosing the trade-off.** Products usually start from "we can block at most X% of good answers".
+`--max-good-blocked` tunes the threshold for that budget on the train split:
 
-- Overall it clearly beats the trivial "flag everything" baseline (F1 63.5% vs 51.8%), in about 3 ms per answer and with no model.
-- It works best on **QA**, where hallucinations are often wrong facts and numbers (F1 46.0% vs a 30.2% baseline).
-- It is **not good enough on its own** for summaries or structured data. On Data2txt it blocks most correct answers and is no better than the baseline, because correct answers paraphrase the data in words it can't match. That is the gap the `nli` and `hybrid` scorers are for.
-- Error analysis on Data2txt found correct answers being rejected because opening hours were written differently (`11 am` vs `11:0`). Normalising clock times fixed that bug and raised Data2txt ROC-AUC from 0.519 to 0.583.
+| Good answers blocked (budget, tuned on train) | Hallucinations caught on test | Precision |
+|---|---|---|
+| ≤ 20% (actual on test: 15.4%) | 51.6% | 64.3% |
+| best F1 (39.7%) | 82.6% | 52.8% |
 
-NLI and hybrid results: *coming soon* (they need a model download; run them yourself with the commands below).
+### What changed, and what we learned
+
+| Version | ROC-AUC | F1 | Catches, if at most 20% of good answers may be blocked |
+|---|---|---|---|
+| v1: weakest claim decides (`min`) | 0.735 | 63.5% | **0%**: about a third of good answers scored exactly 0, so no threshold could block fewer than ~35% |
+| v2: + clock-time normalisation, `lowest_two` | **0.783** | **64.4%** | **62.8%** |
+
+- **Judging by the weakest claim alone was the biggest problem**: long answers have more chances for
+  one low score. Averaging the two weakest claims was chosen because it scored best on a separate
+  sample of 1,200 *train* answers (F1 0.700, ROC-AUC 0.750), not by looking at test results.
+- **Error analysis found a real bug**: correct opening hours were rejected because `11 am` didn't
+  match `11:0` in the source. Clock times are now normalised.
+- **A general-purpose NLI model did not help (yet).** On the same 300 test answers, `hybrid`
+  (numeric gate + `cross-encoder/nli-deberta-v3-small`, every claim scored against every passage
+  separately) reached ROC-AUC 0.708 vs 0.740 for lexical, at ~3.4 s instead of 3 ms per answer.
+  Two causes: claims that combine facts from different passages can't be entailed by any single
+  passage, and structured-data answers needed a median of 334 model calls each.
+  `--evidence-passages 3` (score each claim once against its 3 most relevant passages, joined) is
+  built to fix both; its NLI results are pending.
+- **Still weak:** Data2txt (writing from structured business data) is barely better than chance.
+  Correct answers paraphrase the data in words a lexical scorer can't match.
 
 ### Reproduce
 
 ```bash
 make bench            # lexical, full test set, about a minute
 make install-nli      # once: CPU-only torch + transformers
-make bench-nli        # NLI, 100 answers per task
-make bench-hybrid     # numeric gate + NLI, 100 answers per task
+make bench-nli        # NLI, 100 answers per task, evidence-first
+make bench-hybrid     # numeric gate + NLI, 100 answers per task, evidence-first
+
+# Tune for a "good answers blocked" budget instead of best F1
+python -m groundwire.evals --per-task 0 --dev-per-task 200 --max-good-blocked 0.2
 ```
 
 Each run writes `results/<timestamp>-<scorer>/` containing `report.md` (the table above),

@@ -4,10 +4,11 @@ The runner uses the *same* :class:`GroundingVerifier` the gateway uses in
 production, so benchmark numbers describe the real code path (claim
 splitting, passage chunking, truncation limits), not a separate re-implementation.
 
-Each example is reduced to one **support score**: the support of its weakest
-claim. A response is flagged when that score falls below a threshold, which
-equals the gateway policy ``min_supported_ratio = 1.0`` ("every checkable
-claim must be supported").
+Each example is reduced to one **support score**: the verifier's
+``answer_score``, i.e. the claim scores combined by the configured
+aggregation (``min``, ``lowest_two`` or ``mean``). A response is flagged when
+that score falls below a threshold, exactly as the gateway does in the
+score-based aggregation modes.
 
 Examples run one at a time so per-example latency is measured cleanly.
 """
@@ -36,11 +37,12 @@ class ExampleResult:
         id: Example id.
         task: Task name.
         is_hallucinated: Ground-truth label.
-        support_score: Weakest claim's support (1.0 if no checkable claims).
+        support_score: Aggregated answer score (1.0 if no checkable claims).
         claims: Number of claims checked.
         unsupported_claim: Text of the weakest claim, for error analysis.
         latency_ms: Verification time.
         error: Scorer error message, if verification failed.
+        claim_scores: Every claim's score, for offline analysis.
     """
 
     id: str
@@ -51,12 +53,14 @@ class ExampleResult:
     unsupported_claim: str | None
     latency_ms: float
     error: str | None = None
+    claim_scores: tuple[float, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-serialisable view."""
         data = asdict(self)
         data["support_score"] = round(self.support_score, 4)
         data["latency_ms"] = round(self.latency_ms, 2)
+        data["claim_scores"] = [round(score, 4) for score in self.claim_scores]
         return data
 
 
@@ -92,8 +96,9 @@ async def evaluate(verifier: GroundingVerifier,
         elif report.claims:
             weakest = min(report.claims, key=lambda c: c.score)
             results.append(ExampleResult(example.id, example.task, example.is_hallucinated,
-                                         weakest.score, len(report.claims), weakest.claim,
-                                         report.latency_ms))
+                                         report.answer_score, len(report.claims),
+                                         weakest.claim, report.latency_ms,
+                                         claim_scores=tuple(c.score for c in report.claims)))
         else:
             results.append(ExampleResult(example.id, example.task, example.is_hallucinated,
                                          1.0, 0, None, report.latency_ms))
