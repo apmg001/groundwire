@@ -211,7 +211,7 @@ Configured under `cache:`. A lookup runs after PII redaction and before any prov
 ```json
 "groundwire": {
   "provider": "cache",
-  "cache": {"status": "hit", "match": "semantic", "similarity": 0.9431, "age_s": 12.4, "tokens_saved": 21}
+  "cache": {"status": "hit", "match": "semantic", "similarity": 0.9712, "age_s": 12.4, "tokens_saved": 21}
 }
 ```
 
@@ -245,13 +245,40 @@ sharing one cache, implement the port on Redis or pgvector; nothing else changes
 ("...INV-1043?") scored **0.964** against a cached "...INV-1042?", *higher* than a genuine paraphrase
 of the same question (0.921). A threshold alone would have served one customer's invoice to another.
 
-**Measure it:** `make bench-cache` runs the cache's own normalisation, embedder and guards on
-[Quora Question Pairs](https://huggingface.co/datasets/nyu-mll/glue) (GLUE release; ~40K
-human-labelled validation pairs, many of them deliberately close non-duplicates). Thresholds are
-tuned on a train sample for a **false-hit budget** (e.g. "at most 1% of different questions get a
-cached answer") and reported on validation. The report includes the hardest wrong matches for
-error analysis. Embeddings can rate "enable X" and "disable X" as similar, so pick the threshold
-from the report, then confirm on your own traffic.
+### Benchmark: does the semantic cache serve wrong answers?
+
+`make bench-cache` runs the cache's own normalisation, embedder and guards on
+[Quora Question Pairs](https://huggingface.co/datasets/nyu-mll/glue) (GLUE release): real Quora
+questions paired and labelled by humans as *same question* or *different question*, many of them
+deliberately close ("learn Python" vs "learn Java"). Each pair is treated as "question 1 is cached,
+question 2 arrives". The threshold is **tuned on 20,000 train pairs** for a wrong-answer budget and
+**reported on all 40,430 validation pairs**.
+
+| Wrong-answer budget | Threshold (tuned on train) | Rewordings reused (hit rate) | Different questions answered from cache (false-hit rate) |
+|---|---|---|---|
+| ≤ 5% | 0.90 | 38.1% | 5.0% |
+| **≤ 1% (shipped default)** | **0.96** | **14.9%** | **0.9%** |
+| ≤ 0.1% | 0.99 | 3.0% | 0.1% |
+
+`all-MiniLM-L6-v2` on a laptop CPU (i5-1235U): similarity ROC-AUC **0.874**, **14 ms p50 / 36 ms
+p95** per lookup. The budget tuned on train held on validation (1% asked, 0.9% measured).
+
+**What the numbers say, stated plainly:**
+
+- **The first default (0.92) was too loose.** It served a cached answer to 3.5% of *different*
+  questions. The shipped default is now 0.96, chosen from the data.
+- **Semantic caching saves less than people assume.** At a 1% wrong-answer budget, it reuses about
+  1 in 7 rewordings. Exact matching (always on) carries no such risk.
+- **Small embedding models ignore word order.** "Shifting from Tirupur *to* Chennai" vs "from
+  Chennai *to* Tirupur" scored 0.997. No threshold fixes that, which is why semantic matching is
+  opt-in.
+- **The number guard helps modestly on QQP** (wrong hits 970 → 891 at 0.92, costing 72 correct
+  hits), because few Quora questions hinge on numbers. On invoice- or order-style traffic it
+  matters more (the INV-1042/1043 case above).
+- **The error rate is pessimistic.** Several "wrong" matches are QQP label noise ("How *can* I
+  analyze a short story?" vs "How *do* I…" are labelled different).
+- QQP is general Q&A, not your traffic. Re-run with your model and confirm on your own logs before
+  lowering the threshold.
 
 ---
 

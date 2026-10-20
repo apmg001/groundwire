@@ -43,7 +43,7 @@ cache:
   enabled: true                # reuse earlier answers: saves tokens, money and latency
   semantic: false              # true = also match reworded questions (needs: make install-nli)
   embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  similarity_threshold: 0.92   # cosine similarity needed for a semantic hit (higher = safer)
+  similarity_threshold: 0.96   # measured: <1% wrong answers on QQP with MiniLM (make bench-cache)
   ttl_s: 3600                  # answers expire after an hour
   max_entries: 10000           # least recently used answers are evicted beyond this
   max_temperature: 1.0         # hotter requests asked for variety; don't cache them

@@ -459,7 +459,7 @@ async def test_semantic_hit_for_a_reworded_question() -> None:
     await _prime(cache, chat_request("What is the capital of France?"))
     hit = await cache.lookup(chat_request("Which city is France's capital?"), "default")
     assert hit.hit and hit.match is MatchKind.SEMANTIC
-    assert hit.similarity is not None and hit.similarity > 0.92
+    assert hit.similarity is not None and hit.similarity > 0.96
     assert hit.as_dict()["match"] == "semantic"
 
 
