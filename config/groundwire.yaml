@@ -41,7 +41,7 @@ providers:
     base_url: http://localhost:11434/v1
     model: qwen2.5:3b
     timeout_s: 120
-    enabled: false
+    enabled: true
 
   - name: groq
     type: openai_compatible
