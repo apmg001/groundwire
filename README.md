@@ -53,7 +53,7 @@ line in `providers/factory.py`.
 ## Quick start
 
 ```bash
-git clone <your-repo-url> groundwire && cd groundwire
+git clone https://github.com/apmg001/groundwire.git && cd groundwire
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
