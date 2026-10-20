@@ -241,9 +241,17 @@ skips the cache, and `"refresh"` skips the read and overwrites the entry. Reques
 (LRU, `max_entries`), expiring (`ttl_s`) and partitioned by namespace. For several replicas
 sharing one cache, implement the port on Redis or pgvector; nothing else changes.
 
-**Limit, stated plainly:** `similarity_threshold: 0.92` is a conservative starting point, not a
-measured optimum. Embeddings can rate "enable X" and "disable X" as similar, so keep the threshold
-high and measure on your own traffic before lowering it.
+**Why the guards exist (measured on a laptop with MiniLM):** a question about a *different invoice*
+("...INV-1043?") scored **0.964** against a cached "...INV-1042?", *higher* than a genuine paraphrase
+of the same question (0.921). A threshold alone would have served one customer's invoice to another.
+
+**Measure it:** `make bench-cache` runs the cache's own normalisation, embedder and guards on
+[Quora Question Pairs](https://huggingface.co/datasets/nyu-mll/glue) (GLUE release; ~40K
+human-labelled validation pairs, many of them deliberately close non-duplicates). Thresholds are
+tuned on a train sample for a **false-hit budget** (e.g. "at most 1% of different questions get a
+cached answer") and reported on validation. The report includes the hardest wrong matches for
+error analysis. Embeddings can rate "enable X" and "disable X" as similar, so pick the threshold
+from the report, then confirm on your own traffic.
 
 ---
 
@@ -402,7 +410,8 @@ src/groundwire/
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
-  evals/          RAGTruth benchmark: loader, metrics, runner, report, CLI
+  evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
+                  QQP loader + cachebench/ (semantic-cache benchmark)
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
   core/           config, errors, logging, request context
@@ -424,7 +433,7 @@ scripts/          chaos demo
 - [x] NLI and hybrid benchmark results (negative result, documented)
 - [x] Token-classifier (LettuceDetect) benchmark: 76.1% F1, reproduces the published result
 - [x] Exact + semantic response cache with coalescing, PII-safe keys, fail-open
-- [ ] Semantic-cache benchmark (false-hit rate vs threshold on a paraphrase dataset)
+- [x] Semantic-cache benchmark harness (QQP, threshold tuned for a false-hit budget)
 - [ ] Redis/pgvector cache adapter for multi-replica deployments
 - [ ] Eval harness with a CI regression gate
 - [ ] OpenTelemetry tracing and Grafana dashboard

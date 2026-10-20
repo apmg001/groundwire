@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -37,19 +36,17 @@ from enum import StrEnum
 from typing import Any, TypeVar
 
 from groundwire.cache.embeddings import Embedder, Vector
+from groundwire.cache.guards import semantic_mismatch
 from groundwire.cache.keys import CacheKey, build_cache_key
 from groundwire.cache.store import CacheEntry, CacheStore
 from groundwire.core.config import CacheConfig
 from groundwire.core.errors import CacheUnavailableError
 from groundwire.domain.models import CacheMode, ChatCompletionRequest, Completion
-from groundwire.guardrails.text import numbers
 from groundwire.observability.metrics import GatewayMetrics
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z_]*_\d+\]")
 
 # --------------------------------------------------------------------------- #
 # Lookup result
@@ -236,7 +233,7 @@ class ResponseCache:
         if neighbour.similarity < self._config.similarity_threshold:
             return CacheLookup(status=CacheStatus.MISS, key=key, writable=True, vector=vector,
                                similarity=neighbour.similarity)
-        rejection = _incompatible(key.query, neighbour.entry.query)
+        rejection = semantic_mismatch(key.query, neighbour.entry.query)
         if rejection is not None:
             logger.info("semantic near-miss rejected",
                         extra={"reason": rejection,
@@ -430,20 +427,3 @@ def _cache_mode(request: ChatCompletionRequest) -> CacheMode:
     """
     options = request.groundwire.cache if request.groundwire else None
     return options.mode if options is not None else CacheMode.USE
-
-
-def _incompatible(query: str, cached_query: str) -> str | None:
-    """Reject semantic matches that differ in facts embeddings tend to ignore.
-
-    Args:
-        query: Incoming normalised question.
-        cached_query: Normalised question of the candidate entry.
-
-    Returns:
-        A reason code, or ``None`` when the match is acceptable.
-    """
-    if numbers(query) != numbers(cached_query):
-        return "numbers_differ"
-    if set(_PLACEHOLDER.findall(query.upper())) != set(_PLACEHOLDER.findall(cached_query.upper())):
-        return "placeholders_differ"
-    return None

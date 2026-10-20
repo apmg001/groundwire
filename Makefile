@@ -1,5 +1,5 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
-        bench-data bench bench-nli bench-hybrid bench-token
+        bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -55,3 +55,10 @@ bench-hybrid: bench-data  ## Numeric gate + NLI (needs make install-nli)
 bench-token: bench-data  ## LettuceDetect token classifier, full test set, native 0.5 threshold
 	python -m groundwire.evals --scorer token --per-task 0 --dev-per-task 0 \
 		--threshold 0.5 --aggregation min --min-claim-tokens 1
+
+bench-cache-data: ## Download Quora Question Pairs (GLUE) into data/qqp (~37 MB)
+	./scripts/download_qqp.sh
+	pip install -q -e ".[bench]"
+
+bench-cache: bench-cache-data  ## Semantic-cache hit/false-hit rates (needs make install-nli)
+	python -m groundwire.evals.cachebench --tune-pairs 20000 --test-pairs 0

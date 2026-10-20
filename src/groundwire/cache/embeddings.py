@@ -143,12 +143,13 @@ class TransformersEmbedder(Embedder):
 
     @classmethod
     def load(cls, model_name: str = DEFAULT_EMBEDDING_MODEL, *, max_length: int = 256,
-             num_threads: int | None = None) -> TransformersEmbedder:
+             batch_size: int = 32, num_threads: int | None = None) -> TransformersEmbedder:
         """Download (or read from cache) and load an embedding model.
 
         Args:
             model_name: Hugging Face model id or local directory.
             max_length: Token cap per text.
+            batch_size: Texts per forward pass.
             num_threads: CPU threads for torch; ``None`` keeps torch's default.
 
         Returns:
@@ -177,7 +178,7 @@ class TransformersEmbedder(Embedder):
         model.eval()
         logger.info("cache embedder loaded", extra={"model": model_name})
         return cls(tokenizer=tokenizer, model=model, torch_module=torch,
-                   max_length=max_length, model_name=model_name)
+                   max_length=max_length, batch_size=batch_size, model_name=model_name)
 
     def embed(self, texts: Sequence[str]) -> list[Vector]:
         """Embed texts. See :meth:`Embedder.embed`."""
