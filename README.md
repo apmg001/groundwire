@@ -379,6 +379,50 @@ See `python -m groundwire.evals --help` for sampling, label policy and threshold
 
 ---
 
+## Quality gates: CI fails if accuracy drops
+
+The benchmark numbers above are enforced, not just reported. `config/quality_gates.yaml` defines
+gates; each runs a **fixed, seeded sample with a fixed threshold**, so its numbers only move when
+code, models or data change, never between runs.
+
+| Suite | Runs | Gates | Cost |
+|---|---|---|---|
+| `fast` | every push and PR (`ci.yml`) | lexical fact-checker on 450 RAGTruth answers | ~5 s, no ML deps |
+| `full` | `main`, weekly, PRs touching `guardrails/`, `cache/`, `evals/` (`quality-full.yml`) | LettuceDetect on 150 answers; semantic cache on 5,000 QQP pairs | minutes, CPU torch |
+
+```bash
+make gate                         # what CI runs on every push
+make gate-full                    # model-based gates (needs make install-nli)
+make gate-calibrate SUITE=full    # measure and print suggested bounds
+```
+
+The result appears as a table on the GitHub Actions run page:
+
+```
+## Quality gate `fast`: ❌ FAILED
+| Metric           | Measured | Required  | Result   |
+| roc_auc          | 0.7792   | >= 0.753  | pass     |
+| false_block_rate | 0.4364   | <= 0.433  | **FAIL** |
+```
+
+That failure is real: it came from a simulated bug (word matching made case-sensitive) that the unit
+tests mostly missed.
+
+**Design rules:**
+
+- **Fail-closed.** A gate that crashes, can't find its data, or doesn't report a checked metric counts
+  as failed. `scorer_errors: {max: 0}` fails the build if the model errors on any example.
+- **Bounds move only by review.** `--calibrate` *suggests* bounds (measured ± 0.02); a person commits
+  them. Lowering a bound for a deliberate trade-off happens in the same PR, visible to reviewers.
+- **Weekly runs catch drift** from upstream model or library updates even when nobody pushes.
+
+**Limit, stated plainly:** a gate catches *large* regressions, not one-point changes. Disabling the
+lexical number check moved the 450-answer sample's AUC from 0.774 to 0.796, but on the full 2,700
+answers the difference vanished (0.7829 vs 0.7831). Small effects need the full benchmark, and
+specific behaviours (wrong invoice numbers) are protected by unit tests.
+
+---
+
 ## Operations
 
 | Endpoint | Purpose |
@@ -462,7 +506,7 @@ scripts/          chaos demo
 - [x] Exact + semantic response cache with coalescing, PII-safe keys, fail-open
 - [x] Semantic-cache benchmark harness (QQP, threshold tuned for a false-hit budget)
 - [ ] Redis/pgvector cache adapter for multi-replica deployments
-- [ ] Eval harness with a CI regression gate
+- [x] Benchmark quality gates in CI (fast on every push, model-based weekly/on main)
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

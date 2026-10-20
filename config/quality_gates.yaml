@@ -1,0 +1,54 @@
+# --------------------------------------------------------------------------- #
+# Quality gates: CI fails when a benchmark drops below its bound.
+#
+# Each gate runs a fixed, seeded sample with a fixed threshold, so its numbers
+# only move when code, models or data change. Bounds are reviewed like code:
+#   python -m groundwire.evals.gate --suite <name> --calibrate
+# prints suggestions (measured -/+ 0.02); commit them deliberately.
+# --------------------------------------------------------------------------- #
+
+suites:
+  # Every push and PR. Pure Python, no model downloads, ~5 seconds.
+  fast:
+    - name: grounding-lexical
+      benchmark: ragtruth
+      scorer: lexical
+      per_task: 150              # 450 test answers
+      seed: 13
+      threshold: 0.3014          # tuned for best F1 on RAGTruth train (README, row 2)
+      aggregation: lowest_two
+      # Calibrated 2026-10-20: measured AUC 0.7736, F1 0.6357, good answers blocked 0.4124.
+      checks:
+        roc_auc: {min: 0.753}
+        f1: {min: 0.615}
+        false_block_rate: {max: 0.433}
+        scorer_errors: {max: 0}
+
+  # main, weekly, and PRs touching guardrails/cache/evals. Needs make install-nli + data.
+  full:
+    - name: grounding-token
+      benchmark: ragtruth
+      scorer: token              # LettuceDetect
+      per_task: 50               # 150 test answers, ~3-5 min on CPU
+      seed: 13
+      threshold: 0.5
+      aggregation: min
+      min_claim_tokens: 1
+      # PROVISIONAL: derived from the full-test-set result (F1 0.761, AUC 0.889) with a wide
+      # margin. Tighten with: make gate-calibrate SUITE=full
+      checks:
+        roc_auc: {min: 0.80}
+        f1: {min: 0.65}
+        scorer_errors: {max: 0}
+
+    - name: cache-semantic
+      benchmark: qqp
+      pairs: 5000
+      seed: 13
+      threshold: 0.96            # the shipped cache.similarity_threshold
+      # PROVISIONAL: from the full validation run (false hits 0.009, hit rate 0.149,
+      # AUC 0.874) with a wide margin. Tighten with: make gate-calibrate SUITE=full
+      checks:
+        false_hit_rate: {max: 0.02}
+        hit_rate: {min: 0.10}
+        roc_auc: {min: 0.84}

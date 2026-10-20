@@ -1,5 +1,6 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
-        bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache
+        bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
+        gate gate-full gate-calibrate
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -62,3 +63,14 @@ bench-cache-data: ## Download Quora Question Pairs (GLUE) into data/qqp (~37 MB)
 
 bench-cache: bench-cache-data  ## Semantic-cache hit/false-hit rates (needs make install-nli)
 	python -m groundwire.evals.cachebench --tune-pairs 20000 --test-pairs 0
+
+SUITE ?= fast
+
+gate: bench-data  ## Quality gate CI runs on every push (lexical, ~5 s, no ML deps)
+	python -m groundwire.evals.gate --suite fast
+
+gate-full: bench-data bench-cache-data  ## Model-based quality gates (needs make install-nli)
+	python -m groundwire.evals.gate --suite full
+
+gate-calibrate: bench-data $(if $(filter full,$(SUITE)),bench-cache-data)  ## Print suggested bounds for SUITE=fast|full (review, then commit)
+	python -m groundwire.evals.gate --suite $(SUITE) --calibrate
