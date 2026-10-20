@@ -155,11 +155,43 @@ Measured on **[RAGTruth](https://github.com/ParticleMedia/RAGTruth)**: 2,700 rea
 retrieval-augmented prompts (question answering, news summaries, and descriptions written from
 business data), each labelled by human annotators as hallucinated or not.
 
-The benchmark runs the **same verifier the gateway uses**. The decision threshold is tuned on the
-*train* split and applied unchanged to the *test* split, so the numbers are not tuned on the data
-they report. A response is flagged when its answer score (claim scores combined by the configured aggregation) falls below the threshold.
+The benchmark runs the **same verifier the gateway uses**. A response is flagged when its answer
+score (claim scores combined by the configured aggregation) falls below a threshold. Thresholds are
+either tuned on the *train* split and applied unchanged to *test*, or fixed in advance; never tuned
+on the numbers they report.
 
-### Results: lexical scorer (no ML model), full test set
+### Headline: full RAGTruth test set (2,700 answers)
+
+| Scorer | F1 | Precision | Recall | ROC-AUC | Good answers blocked | Latency p50 (laptop CPU) |
+|---|---|---|---|---|---|---|
+| `lexical` (rules, no model) | 64.4% | 52.8% | 82.6% | 0.783 | 39.7% | 3 ms |
+| **`token`** (LettuceDetect-base) | **76.1%** | **76.6%** | 75.5% | **0.889** | **12.3%** | 975 ms |
+| *Flag everything (baseline)* | *51.8%* | *34.9%* | *100%* | *0.5* | *100%* | – |
+
+**Switching to the token scorer cut wrongly blocked good answers from 39.7% to 12.3%** while raising
+F1 from 64.4% to 76.1%. It costs about a second per answer on a laptop CPU (Intel i5-1235U).
+
+**Reproduction check.** LettuceDetect's paper reports 76.07% F1 for this model on the RAGTruth test
+set (QA 65.52%, Data2txt 87.89%, Summary 50.52%). Groundwire, running it through its own
+verifier pipeline, measured **76.1%** (QA 65.5%, Data2txt 87.9%, Summary 50.5%), matching to the first
+decimal. That confirms the integration is faithful, not just "inspired by" the model.
+
+> Fairness note: LettuceDetect was fine-tuned on the RAGTruth *train* split, so this is an
+> in-distribution result; the test split is held out. Its benchmark uses the model's native 0.5
+> threshold with no tuning. Expect lower accuracy on very different domains until measured there.
+
+### Token scorer by task
+
+| Task | Responses | Hallucinated | Precision | Recall | F1 | F1 if flagging everything | ROC-AUC | Good answers blocked | Latency p50 / p95 |
+|---|---|---|---|---|---|---|---|---|---|
+| **All tasks** | 2700 | 34.9% | 76.6% | 75.5% | **76.1%** | 51.8% | **0.889** | 12.3% | 975 / 2472 ms |
+| QA | 900 | 17.8% | 60.6% | 71.2% | 65.5% | 30.2% | 0.901 | 10.0% | 725 / 1178 ms |
+| Summary | 900 | 22.7% | 53.9% | 47.5% | 50.5% | 37.0% | 0.756 | 11.9% | 917 / 3380 ms |
+| Data2txt | 900 | 64.3% | 89.3% | 86.5% | 87.9% | 78.3% | 0.904 | 18.7% | 1327 / 2324 ms |
+
+Summaries remain the hardest case: it catches fewer than half of hallucinated summaries.
+
+### Lexical scorer by task
 
 Answer score = average of the two weakest claims (`lowest_two`), threshold tuned for best F1 on train:
 
@@ -170,44 +202,30 @@ Answer score = average of the two weakest claims (`lowest_two`), threshold tuned
 | Summary | 900 | 22.7% | 33.9% | 51.5% | 40.9% | 37.0% | 0.667 | 29.4% | 3 ms |
 | Data2txt | 900 | 64.3% | 64.6% | 99.5% | 78.3% | 78.3% | 0.592 | 98.4% | 11 ms |
 
-**Choosing the trade-off.** Products usually start from "we can block at most X% of good answers".
-`--max-good-blocked` tunes the threshold for that budget on the train split:
+`--max-good-blocked` tunes the lexical threshold for a budget instead: at ≤ 20% good answers blocked
+(15.4% on test) it catches 51.6% of hallucinations with 64.3% precision. Use it when latency
+matters more than accuracy.
 
-| Good answers blocked (budget, tuned on train) | Hallucinations caught on test | Precision |
-|---|---|---|
-| ≤ 20% (actual on test: 15.4%) | 51.6% | 64.3% |
-| best F1 (39.7%) | 82.6% | 52.8% |
+### How we got here
 
-### What changed, and what we learned
+| Step | ROC-AUC | F1 | Good answers blocked | What changed |
+|---|---|---|---|---|
+| 1. Lexical, weakest claim decides | 0.735 | 63.5% | 34.8% | First measurement |
+| 2. + clock-time fix, `lowest_two` | 0.783 | 64.4% | 39.7% (tunable) | Error analysis + better aggregation |
+| 3. General NLI (`hybrid`), 300-answer sample | 0.708 | 61.6% | 50.0% | Worse, and ~1,000× slower |
+| 4. General NLI, evidence-first, 300-answer sample | 0.677 | 56.3% | 78.6% | 10× faster than step 3, still worse |
+| **5. Task-trained token classifier** | **0.889** | **76.1%** | **12.3%** | Model trained for exactly this job |
 
-| Version | ROC-AUC | F1 | Catches, if at most 20% of good answers may be blocked |
-|---|---|---|---|
-| v1: weakest claim decides (`min`) | 0.735 | 63.5% | **0%**: about a third of good answers scored exactly 0, so no threshold could block fewer than ~35% |
-| v2: + clock-time normalisation, `lowest_two` | **0.783** | **64.4%** | **62.8%** |
-
-- **Judging by the weakest claim alone was the biggest problem**: long answers have more chances for
-  one low score. Averaging the two weakest claims was chosen because it scored best on a separate
-  sample of 1,200 *train* answers (F1 0.700, ROC-AUC 0.750), not by looking at test results.
+- **Judging by the weakest claim alone over-penalised long answers.** Averaging the two weakest was
+  chosen because it scored best on a separate sample of 1,200 *train* answers, not by looking at test.
 - **Error analysis found a real bug**: correct opening hours were rejected because `11 am` didn't
   match `11:0` in the source. Clock times are now normalised.
-- **A general-purpose NLI model did not help (yet).** On the same 300 test answers, `hybrid`
-  (numeric gate + `cross-encoder/nli-deberta-v3-small`, every claim scored against every passage
-  separately) reached ROC-AUC 0.708 vs 0.740 for lexical, at ~3.4 s instead of 3 ms per answer.
-  Two causes: claims that combine facts from different passages can't be entailed by any single
-  passage, and structured-data answers needed a median of 334 model calls each.
-  `--evidence-passages 3` (score each claim once against its 3 most relevant passages, joined) is
-  built to fix both; its NLI results are pending.
-- **Evidence-first made NLI 10× faster but not more accurate.** On the same 300 answers,
-  `hybrid --evidence-passages 3` cut Data2txt latency from 13.5 s to 1.3 s per answer, but
-  ROC-AUC fell to 0.677 (Summary 0.448). The tuned thresholds (0.0009, then 0.012) show why:
-  this general-purpose model, trained on short sentence pairs, gives near-zero entailment to
-  almost every claim checked against long evidence, true or not. It is the wrong tool here.
-- **Next: a model trained for this exact task.** The `token` scorer runs LettuceDetect, which
-  was fine-tuned on the RAGTruth *train* split and reads all passages at once. Because it was
-  trained on train, its benchmark uses the model's native 0.5 threshold with no tuning
-  (`make bench-token`). Results pending.
-- **Still weak:** Data2txt (writing from structured business data) is barely better than chance.
-  Correct answers paraphrase the data in words a lexical scorer can't match.
+- **A general-purpose NLI model was the wrong tool.** `nli-deberta-v3-small` is trained on short
+  sentence pairs; against long evidence it gave near-zero entailment to almost every claim, true
+  or not (tuned thresholds collapsed to 0.0009 and 0.012). Evidence-first pairing fixed the speed
+  but not the accuracy.
+- **What worked was a model trained on this task**, which reads every passage and the whole answer
+  at once and labels each answer token.
 
 ### Reproduce
 
@@ -305,7 +323,7 @@ scripts/          chaos demo
 - [ ] Semantic cache (embeddings + Redis/pgvector)
 - [ ] Prompt-injection detection and PII redaction
 - [x] NLI and hybrid benchmark results (negative result, documented)
-- [ ] Token-classifier (LettuceDetect) benchmark results
+- [x] Token-classifier (LettuceDetect) benchmark: 76.1% F1, reproduces the published result
 - [ ] Eval harness with a CI regression gate
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
