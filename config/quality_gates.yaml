@@ -34,11 +34,13 @@ suites:
       threshold: 0.5
       aggregation: min
       min_claim_tokens: 1
-      # PROVISIONAL: derived from the full-test-set result (F1 0.761, AUC 0.889) with a wide
-      # margin. Tighten with: make gate-calibrate SUITE=full
+      # Calibrated 2026-10-20 on a laptop CPU: AUC 0.9263, F1 0.8515, good answers
+      # blocked 0.0515. This 150-answer sample is easier than the full test set (F1 0.761
+      # there); quote the full-set number, gate on this one.
       checks:
-        roc_auc: {min: 0.80}
-        f1: {min: 0.65}
+        roc_auc: {min: 0.906}
+        f1: {min: 0.831}
+        false_block_rate: {max: 0.072}
         scorer_errors: {max: 0}
 
     - name: cache-semantic
@@ -46,9 +48,11 @@ suites:
       pairs: 5000
       seed: 13
       threshold: 0.96            # the shipped cache.similarity_threshold
-      # PROVISIONAL: from the full validation run (false hits 0.009, hit rate 0.149,
-      # AUC 0.874) with a wide margin. Tighten with: make gate-calibrate SUITE=full
+      # Calibrated 2026-10-20: false hits 0.0107, hit rate 0.1646, AUC 0.8770.
+      # false_hit_rate is held to 0.015, tighter than the generic +0.02 suggestion
+      # (0.031): the product promise is "about 1% wrong answers", and +2 points
+      # would triple it before the gate noticed.
       checks:
-        false_hit_rate: {max: 0.02}
-        hit_rate: {min: 0.10}
-        roc_auc: {min: 0.84}
+        false_hit_rate: {max: 0.015}
+        hit_rate: {min: 0.144}
+        roc_auc: {min: 0.856}
