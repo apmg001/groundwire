@@ -26,6 +26,18 @@ grounding:
   min_claim_tokens: 3
   on_error: fail_open          # fail_open | fail_closed
 
+safety:
+  injection:
+    action: block              # off | flag | block
+    detector: heuristic        # heuristic | classifier | both (classifier needs: make install-nli)
+    threshold: 0.7             # score at or above which the action applies
+    scan_user_messages: true   # direct injection
+    scan_context: true         # indirect injection hidden in grounding documents
+  pii:
+    enabled: true              # replace PII with placeholders before any provider sees it
+    types: [email, phone, card, aadhaar, pan, ip_address]
+    restore_output: true       # put real values back into the answer for the client
+
 providers:
   # Local model served by llama.cpp:  llama-server -m qwen2.5-3b-instruct-q4_k_m.gguf --port 8080
   - name: llama-local

@@ -42,6 +42,8 @@ from groundwire.domain.models import (
 from groundwire.guardrails.grounding import GroundingReport, GroundingVerifier, Verdict
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.routing.router import Router
+from groundwire.safety.guard import PreparedRequest, SafetyGuard
+from groundwire.safety.pii import StreamRestorer
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,7 @@ class ChatService:
         metrics: GatewayMetrics,
         *,
         request_timeout_s: float,
+        safety: SafetyGuard | None = None,
     ) -> None:
         """Create the service.
 
@@ -81,11 +84,13 @@ class ChatService:
             metrics: Metrics sink.
             request_timeout_s: End-to-end deadline for producing a response
                 (non-streaming) or the first chunk (streaming).
+            safety: Prompt-injection and PII guard; ``None`` disables both.
         """
         self._router = router
         self._verifier = verifier
         self._metrics = metrics
         self._timeout_s = request_timeout_s
+        self._safety = safety
 
     # ------------------------------------------------------------------ #
     # Non-streaming
@@ -107,15 +112,17 @@ class ChatService:
             ProviderBadRequestError: Upstream rejected the request.
             GroundingViolationError: Grounding failed in ``block`` mode.
             GuardrailUnavailableError: Grounding could not run (fail-closed).
+            PromptInjectionError: Injection detected and the policy is ``block``.
         """
         route = self._router.resolve(request.model)
         started = time.perf_counter()
         provider = "none"
         status = "error"
         try:
+            prepared = self._prepare(request)
             try:
                 async with asyncio.timeout(self._timeout_s):
-                    routed = await self._router.complete(route, request)
+                    routed = await self._router.complete(route, prepared.request)
             except TimeoutError as exc:
                 raise GatewayTimeoutError(
                     f"no provider answered within {self._timeout_s:.0f}s",
@@ -123,22 +130,28 @@ class ChatService:
                 ) from exc
             provider = routed.provider
 
+            text = (self._safety.restore(routed.completion.text, prepared)
+                    if self._safety else routed.completion.text)
             meta: dict[str, Any] = {
                 "route": route,
                 "provider": routed.provider,
                 "upstream_model": routed.completion.upstream_model,
                 "attempts": [a.as_dict() for a in routed.attempts],
             }
+            safety_meta = prepared.metadata()
+            if safety_meta:
+                meta["safety"] = safety_meta
             grounding = request.groundwire.grounding if request.groundwire else None
             if grounding is not None:
-                report = await self._check_grounding(routed.completion.text, grounding,
+                # Ground the *restored* answer against the original (unredacted) context.
+                report = await self._check_grounding(text, grounding,
                                                      _last_user_message(request))
                 meta["grounding"] = report.as_dict()
 
             status = "success"
             return ChatCompletionResponse(
                 model=request.model,
-                choices=[Choice(message=AssistantMessage(content=routed.completion.text),
+                choices=[Choice(message=AssistantMessage(content=text),
                                 finish_reason=routed.completion.finish_reason)],
                 usage=routed.completion.usage,
                 groundwire=meta,
@@ -172,6 +185,7 @@ class ChatService:
             ModelNotFoundError: Unknown route.
             GatewayTimeoutError: No stream started before the deadline.
             AllProvidersFailedError: Every provider failed to start a stream.
+            PromptInjectionError: Injection detected and the policy is ``block``.
         """
         grounding = request.groundwire.grounding if request.groundwire else None
         if grounding is not None and grounding.mode is GroundingMode.BLOCK:
@@ -183,8 +197,9 @@ class ChatService:
         route = self._router.resolve(request.model)
         started = time.perf_counter()
         try:
+            prepared = self._prepare(request)
             async with asyncio.timeout(self._timeout_s):
-                routed = await self._router.stream(route, request)
+                routed = await self._router.stream(route, prepared.request)
         except TimeoutError as exc:
             self._record_request(route, "none", GatewayTimeoutError.code, stream=True,
                                  started=started)
@@ -197,7 +212,7 @@ class ChatService:
             raise
 
         events = self._stream_events(request, route, routed.provider, routed.chunks,
-                                     grounding, started)
+                                     grounding, started, prepared)
         return StreamSession(provider=routed.provider, route=route, events=events)
 
     async def _stream_events(
@@ -208,6 +223,7 @@ class ChatService:
         chunks: AsyncIterator[StreamChunk],
         grounding: GroundingOptions | None,
         started: float,
+        prepared: PreparedRequest,
     ) -> AsyncIterator[dict[str, Any]]:
         """Convert router chunks into SSE payloads.
 
@@ -218,6 +234,7 @@ class ChatService:
             chunks: Router chunk iterator.
             grounding: Grounding options (``flag`` mode only).
             started: ``perf_counter`` at request start.
+            prepared: Safety-processed request (for PII restoration).
 
         Yields:
             JSON-serialisable payloads.
@@ -226,20 +243,44 @@ class ChatService:
         created = int(time.time())
         parts: list[str] = []
         status = "error"
+        restorer: StreamRestorer | None = (self._safety.stream_restorer(prepared)
+                                           if self._safety else None)
         try:
             async for chunk in chunks:
                 chunk.id, chunk.created, chunk.model = stream_id, created, request.model
+                if restorer is not None:
+                    _restore_chunk(chunk, restorer)
+                    if chunk.choices and chunk.choices[0].finish_reason is not None:
+                        # Release anything held back *before* the finish marker.
+                        tail = restorer.flush()
+                        if tail:
+                            delta = chunk.choices[0].delta
+                            delta.content = (delta.content or "") + tail
                 if grounding is not None:
                     parts.append(chunk.content())
-                yield chunk.model_dump(exclude_none=True)
+                if chunk.content() or chunk.usage or any(
+                        c.finish_reason is not None for c in chunk.choices):
+                    yield chunk.model_dump(exclude_none=True)
 
+            if restorer is not None:
+                tail = restorer.flush()
+                if tail:
+                    parts.append(tail)
+                    yield StreamChunk.text(tail).model_copy(update={
+                        "id": stream_id, "created": created, "model": request.model,
+                    }).model_dump(exclude_none=True)
+
+            extra: dict[str, Any] = {"route": route, "provider": provider}
+            safety_meta = prepared.metadata()
+            if safety_meta:
+                extra["safety"] = safety_meta
             if grounding is not None:
                 report = await self._check_grounding("".join(parts), grounding,
                                                      _last_user_message(request))
+                extra["grounding"] = report.as_dict()
+            if grounding is not None or safety_meta:
                 yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
-                       "model": request.model, "choices": [],
-                       "groundwire": {"route": route, "provider": provider,
-                                      "grounding": report.as_dict()}}
+                       "model": request.model, "choices": [], "groundwire": extra}
             status = "success"
         except GroundwireError as exc:
             status = exc.code
@@ -260,6 +301,24 @@ class ChatService:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+
+    def _prepare(self, request: ChatCompletionRequest) -> PreparedRequest:
+        """Apply the safety guard (if any) to a request.
+
+        Args:
+            request: Client request.
+
+        Returns:
+            The prepared request.
+
+        Raises:
+            PromptInjectionError: Injection detected and policy is ``block``.
+            GuardrailUnavailableError: The injection detector failed.
+        """
+        if self._safety is None:
+            return PreparedRequest(request=request)
+        grounding = request.groundwire.grounding if request.groundwire else None
+        return self._safety.prepare(request, grounding.context if grounding else None)
 
     async def _check_grounding(self, answer: str, options: GroundingOptions,
                                question: str | None = None) -> GroundingReport:
@@ -298,6 +357,18 @@ class ChatService:
                                       stream=stream_label).inc()
         self._metrics.request_latency.labels(route=route, stream=stream_label).observe(
             time.perf_counter() - started)
+
+
+def _restore_chunk(chunk: StreamChunk, restorer: StreamRestorer) -> None:
+    """Restore PII placeholders in a streaming chunk in place.
+
+    Args:
+        chunk: Chunk to modify.
+        restorer: Stateful restorer for this stream.
+    """
+    for choice in chunk.choices:
+        if choice.delta.content:
+            choice.delta.content = restorer.feed(choice.delta.content) or None
 
 
 def _last_user_message(request: ChatCompletionRequest) -> str | None:

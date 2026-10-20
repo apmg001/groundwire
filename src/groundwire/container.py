@@ -16,6 +16,7 @@ from groundwire.observability.metrics import GatewayMetrics
 from groundwire.providers.base import Provider
 from groundwire.providers.factory import build_providers, close_providers
 from groundwire.routing.router import Router
+from groundwire.safety.guard import SafetyGuard
 from groundwire.services.chat import ChatService
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class Container:
         metrics: Metrics registry.
         router: Provider router.
         verifier: Grounding verifier.
+        safety: Prompt-injection and PII guard.
         chat: Chat completion service.
     """
 
@@ -39,6 +41,7 @@ class Container:
     metrics: GatewayMetrics
     router: Router
     verifier: GroundingVerifier
+    safety: SafetyGuard
     chat: ChatService
 
     async def aclose(self) -> None:
@@ -52,6 +55,7 @@ def build_container(
     *,
     providers: dict[str, Provider] | None = None,
     verifier: GroundingVerifier | None = None,
+    safety: SafetyGuard | None = None,
 ) -> Container:
     """Wire up every component from configuration.
 
@@ -59,6 +63,7 @@ def build_container(
         config: Validated gateway configuration.
         providers: Pre-built providers (tests); built from config if omitted.
         verifier: Pre-built verifier (tests); built from config if omitted.
+        safety: Pre-built safety guard (tests); built from config if omitted.
 
     Returns:
         The container.
@@ -73,6 +78,8 @@ def build_container(
     metrics = GatewayMetrics()
     router = Router(config, built_providers, metrics=metrics)
     grounding = verifier or build_verifier(config.grounding)
-    chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s)
+    guard = safety or SafetyGuard(config.safety, metrics=metrics)
+    chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
+                       safety=guard)
     return Container(config=config, providers=built_providers, metrics=metrics,
-                     router=router, verifier=grounding, chat=chat)
+                     router=router, verifier=grounding, safety=guard, chat=chat)

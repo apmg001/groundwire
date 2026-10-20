@@ -46,14 +46,17 @@ class ScriptedProvider(Provider):
         self._delay_s = delay_s
         self.calls = 0
         self.closed = False
+        self.requests: list[ChatCompletionRequest] = []
 
-    def _next(self) -> Outcome:
+    def _next(self, request: ChatCompletionRequest | None = None) -> Outcome:
+        if request is not None:
+            self.requests.append(request)
         index = min(self.calls, len(self._outcomes) - 1)
         self.calls += 1
         return self._outcomes[index]
 
     async def complete(self, request: ChatCompletionRequest) -> Completion:
-        outcome = self._next()
+        outcome = self._next(request)
         if self._delay_s:
             await asyncio.sleep(self._delay_s)
         if isinstance(outcome, Exception):
@@ -62,7 +65,7 @@ class ScriptedProvider(Provider):
         return Completion(text=text, usage=Usage.of(3, 5), upstream_model=self.model)
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[StreamChunk]:
-        outcome = self._next()
+        outcome = self._next(request)
         if self._delay_s:
             await asyncio.sleep(self._delay_s)
         if isinstance(outcome, Exception):

@@ -149,6 +149,46 @@ Scoring is CPU-bound, so it runs in a worker thread behind a concurrency limit a
 
 ---
 
+## Safety: prompt injection and PII
+
+Two checks run on every request **before any model sees it** (configured under `safety:`).
+
+**Prompt-injection screening.** User messages (direct attacks) and grounding documents
+(indirect attacks hidden in retrieved content) are scanned. `block` returns HTTP 400
+`prompt_injection_detected` and **no provider is called**; `flag` lets the request through and
+reports findings in `groundwire.safety`.
+
+| Detector | How | Trade-off |
+|---|---|---|
+| `heuristic` (default) | Weighted rules for instruction override, role hijack, system-prompt extraction, fake chat-template markers, data exfiltration via links, and text addressed to "the AI". Text is normalised first (Unicode NFKC, zero-width characters removed), so `ig\u200bnore previous instructions` still matches. | ~1 ms, explainable, but only knows the patterns it was written for |
+| `classifier` | [`protectai/deberta-v3-base-prompt-injection-v2`](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) (Apache-2.0), long texts scored in overlapping windows | Generalises better; English only, model card advises against scanning system prompts |
+| `both` | Maximum of the two | Best coverage |
+
+**PII redaction.** Emails, phone numbers, card numbers (Luhn-checked), Aadhaar (Verhoeff-checked),
+PAN and IPv4 addresses are replaced with placeholders in *every* message sent to providers, then
+restored in the answer, including while streaming, where a placeholder can arrive split across chunks:
+
+```
+client  : "Refund rahul@example.com, card 4111 1111 1111 1111"
+provider: "Refund [EMAIL_1], card [CARD_1]"
+answer  : "Refund sent to [EMAIL_1]."  ->  client sees "Refund sent to rahul@example.com."
+```
+
+The same value always gets the same placeholder within a request, raw values are held only in
+memory for that request, and only counts are logged.
+
+**Limits, stated plainly:**
+
+- **No filter prevents prompt injection.** Screening is one layer. The ones that matter more are
+  architectural: keep decisions (refunds, permissions) in deterministic code, give the model least
+  privilege, never put secrets in prompts, and check outputs (the grounding check above blocks
+  unsupported claims an injected document tries to plant).
+- **Regex PII detection covers structured identifiers only.** It does not reliably find names,
+  addresses or business secrets. For data that must never leave your servers, route to local
+  models only (`llama-local`, `ollama-local`); redaction is for when cloud models are allowed.
+
+---
+
 ## Benchmark: does the fact-checker actually work?
 
 Measured on **[RAGTruth](https://github.com/ParticleMedia/RAGTruth)**: 2,700 real LLM answers to
@@ -302,6 +342,7 @@ src/groundwire/
   routing/        Router: fallback chains, failover, streaming handoff
   resilience/     RetryPolicy, CircuitBreaker
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
+  safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   evals/          RAGTruth benchmark: loader, metrics, runner, report, CLI
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
@@ -321,7 +362,7 @@ scripts/          chaos demo
 - [x] Reproducible RAGTruth benchmark with train-tuned thresholds
 - [x] Metrics, structured logs, Docker, CI
 - [ ] Semantic cache (embeddings + Redis/pgvector)
-- [ ] Prompt-injection detection and PII redaction
+- [x] Prompt-injection screening (heuristic + optional classifier) and PII redaction with restoration
 - [x] NLI and hybrid benchmark results (negative result, documented)
 - [x] Token-classifier (LettuceDetect) benchmark: 76.1% F1, reproduces the published result
 - [ ] Eval harness with a CI regression gate

@@ -275,6 +275,13 @@ class GroundingViolationError(GroundwireError):
     code = "grounding_violation"
 
 
+class PromptInjectionError(GroundwireError):
+    """The request looks like a prompt-injection attempt and policy is ``block``."""
+
+    http_status = 400
+    code = "prompt_injection_detected"
+
+
 class GuardrailUnavailableError(GroundwireError):
     """A guardrail could not run (model missing, crashed...) and policy is fail-closed."""
 

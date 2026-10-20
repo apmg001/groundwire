@@ -65,6 +65,12 @@ class GatewayMetrics:
         self.grounding = Counter(
             "groundwire_grounding_checks_total", "Grounding verdicts.",
             ["verdict"], registry=r)
+        self.injection_checks = Counter(
+            "groundwire_injection_checks_total", "Prompt-injection screening outcomes.",
+            ["action"], registry=r)
+        self.pii_redactions = Counter(
+            "groundwire_pii_redactions_total", "Distinct PII values redacted, by type.",
+            ["type"], registry=r)
         self.grounding_latency = Histogram(
             "groundwire_grounding_duration_seconds", "Grounding check latency.",
             buckets=_LATENCY_BUCKETS, registry=r)
