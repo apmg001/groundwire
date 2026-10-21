@@ -256,7 +256,7 @@ def load_ragtruth(
             context=context,
             response=str(record.get("response", "")),
             is_hallucinated=ragtruth_label(labels, label_policy),
-            meta={"model": record.get("model"),
+            meta={"model": record.get("model"), "source_id": str(record.get("source_id")),
                   "span_types": sorted({str(s.get("label_type")) for s in labels})},
             prompt=str(source["prompt"]) if source.get("prompt") else None,
         ))

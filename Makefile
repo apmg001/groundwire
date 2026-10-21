@@ -1,6 +1,6 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
         bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
-        gate gate-full gate-calibrate
+        gate gate-full gate-calibrate bench-cascade bench-cascade-token
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -74,3 +74,11 @@ gate-full: bench-data bench-cache-data  ## Model-based quality gates (needs make
 
 gate-calibrate: bench-data $(if $(filter full,$(SUITE)),bench-cache-data)  ## Print suggested bounds for SUITE=fast|full (review, then commit)
 	python -m groundwire.evals.gate --suite $(SUITE) --calibrate
+
+bench-cascade: bench-data  ## Cheap-first routing simulation, lexical check (no ML deps, ~5 s)
+	python -m groundwire.evals.cascade --cheap llama-2-7b-chat
+	python -m groundwire.evals.cascade --cheap gpt-3.5-turbo-0613
+
+bench-cascade-token: bench-data  ## Same with LettuceDetect as the check (needs make install-nli, ~15 min)
+	python -m groundwire.evals.cascade --cheap llama-2-7b-chat --scorer token
+	python -m groundwire.evals.cascade --cheap gpt-3.5-turbo-0613 --scorer token
