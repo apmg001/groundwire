@@ -10,9 +10,18 @@ from groundwire.evals.gate.checks import GateResult, suggest_bound
 
 
 def _fmt(value: float | None) -> str:
+    """Format a metric: counts as integers, rates with 4 decimals.
+
+    Args:
+        value: Metric value (an ``int`` is accepted too).
+
+    Returns:
+        Display text.
+    """
     if value is None:
         return "not measured"
-    return f"{value:.0f}" if value.is_integer() and value > 1 else f"{value:.4f}"
+    number = float(value)  # int.is_integer() only exists from Python 3.12
+    return f"{number:.0f}" if number.is_integer() and number > 1 else f"{number:.4f}"
 
 
 def render_markdown(suite: str, results: Sequence[GateResult]) -> str:
