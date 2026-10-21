@@ -13,6 +13,8 @@ OpenAI SDK at it by changing one URL, and every call gets:
 - **Prompt-injection screening and PII redaction** before any model sees the request.
 - **Exact + semantic response cache** with request coalescing: repeat and reworded
   questions are answered without a model call.
+- **Cascade routing**: cheap model first, strong model only when the answer fails the
+  fact-check (matched GPT-4's hallucination rate at ~15% of its cost on RAGTruth).
 - **Structured JSON logs** with request IDs, and **Prometheus metrics**.
 
 Runs fully offline on a laptop CPU. No GPU, no cloud account required.
@@ -379,6 +381,67 @@ See `python -m groundwire.evals --help` for sampling, label policy and threshold
 
 ---
 
+## Cascade routing: cheap model first, strong model only when needed
+
+Strong models are accurate but expensive; cheap ones are cheap but make more things up. A
+**cascade** sends each request to the cheap tier first, **fact-checks the answer against the
+request's documents**, and calls the strong tier only if the check fails.
+
+```yaml
+cascades:
+  smart:                         # clients send model: "smart"
+    cheap: [gpt-35, ollama-local]  # a normal provider chain (retries, failover, breakers)
+    strong: [openai-gpt4, anthropic]
+    escalate_below: 0.5          # escalate when the answer score is below this
+```
+
+```json
+"cascade": {"tier": "strong", "reason": "low_support", "escalated": true, "cheap_score": 0.0}
+```
+
+**Measured before it was built.** RAGTruth answers every test prompt with six models, each labelled
+by humans, so a cascade can be replayed offline (`make bench-cascade-token`, LettuceDetect as the
+check, 450 test prompts, strong call priced at 15× a cheap one):
+
+| Cheap → strong | Cheap only | **Cascade** | Strong only | Cascade cost vs strong-only |
+|---|---|---|---|---|
+| GPT-3.5 → GPT-4 | 10.2% hallucinated | **7.1%** (8.4% escalated) | 9.3% | **15%** |
+| Llama-2-7B → GPT-4 | 50.2% | **19.8%** (46% escalated) | 9.3% | **53%** |
+
+- **When the cheap model is decent, it works:** GPT-3.5 → GPT-4 matched GPT-4's hallucination rate
+  at about 15% of the cost. The two models make different mistakes, so the checked cheap answer is
+  often right where the strong one is not. The difference (7.1% vs 9.3%) is about 10 of 450 answers,
+  so read it as "matches", not "beats".
+- **When the cheap model is weak, it doesn't:** Llama-2-7B is wrong half the time, so half of all
+  requests pay for both models, and the check misses some. Even a perfect check could only reach 57%
+  of the strong-only cost. **Savings are capped by how often the cheap tier is right.**
+- The lexical check was a poor escalation signal (it escalated 99% of Data2txt answers); LettuceDetect
+  cut escalations from 41% to 8% on GPT-3.5 → GPT-4.
+
+**Behaviour you can rely on:**
+
+- **Never less available than its tiers.** Cheap tier down → strong serves. Strong tier down on
+  escalation → the cheap answer is served and marked `strong_unavailable`. Check crashes →
+  `on_check_error` (default: escalate). Client faults (HTTP 400) are not retried on the other tier.
+- **No documents, no check:** requests without `groundwire.grounding.context` go to the
+  `without_context` tier (default: strong).
+- **PII-safe:** the cheap answer is checked *after* PII is restored, so placeholders don't cause
+  false escalations; providers still only see placeholders.
+- **Checked once:** when the cheap answer is served, its check result doubles as the client's
+  grounding report.
+- **Streaming works, later:** an answer must be complete before it can be checked, so cascades
+  generate in full, check, then stream. The first token arrives later, and grounding `block` mode
+  works with `stream: true` on cascades (nothing is sent before the check).
+- **Watch it:** `groundwire_cascade_requests_total{tier,reason}`. A high `low_support` share means
+  the cheap model is too weak for that traffic and the cascade is costing you, not saving.
+
+**Limits, stated plainly:** these are 2023 models and a 15× price ratio is an assumption; latency was
+not simulated (escalated requests take two generations plus the check); and LettuceDetect was trained
+on RAGTruth's train split (the test prompts are held out, but it is home ground). Re-run the
+simulation with your own models' answers before relying on the numbers.
+
+---
+
 ## Quality gates: CI fails if accuracy drops
 
 The benchmark numbers above are enforced, not just reported. `config/quality_gates.yaml` defines
@@ -476,13 +539,14 @@ some failures, the breaker opens and routes around the rest.
 src/groundwire/
   api/            routes, ASGI middleware (request ID, body limit), error mapping
   services/       ChatService: safety, cache, deadline, grounding policy, metrics
-  routing/        Router: fallback chains, failover, streaming handoff
+  routing/        Router (fallback chains, failover, streaming handoff), CascadeRunner
   resilience/     RetryPolicy, CircuitBreaker
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
   evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
-                  QQP loader + cachebench/ (semantic-cache benchmark)
+                  QQP loader + cachebench/ (semantic-cache benchmark);
+                  cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics
   core/           config, errors, logging, request context
@@ -507,6 +571,7 @@ scripts/          chaos demo
 - [x] Semantic-cache benchmark harness (QQP, threshold tuned for a false-hit budget)
 - [ ] Redis/pgvector cache adapter for multi-replica deployments
 - [x] Benchmark quality gates in CI (fast on every push, model-based weekly/on main)
+- [x] Cascade routing with fact-check escalation, simulated on RAGTruth before it was built
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

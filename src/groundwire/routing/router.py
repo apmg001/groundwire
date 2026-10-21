@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TypeVar
 
-from groundwire.core.config import GatewayConfig
+from groundwire.core.config import CascadeConfig, CascadeTier, GatewayConfig
 from groundwire.core.errors import (
     AllProvidersFailedError,
     AttemptRecord,
@@ -129,10 +129,36 @@ class Router:
         # Disabled providers are dropped from chains here, once.
         self._routes: dict[str, list[str]] = {}
         for route, chain in config.routes.items():
-            usable = [p for p in chain if p in providers]
-            if not usable:
-                raise ConfigurationError(f"route '{route}' has no enabled providers")
-            self._routes[route] = usable
+            self._routes[route] = self._usable(route, chain)
+
+        # Cascade tiers are internal chains ("<cascade>:cheap", "<cascade>:strong"),
+        # so each tier gets the same retries, breakers and failover as a route.
+        # They are not client-selectable aliases.
+        self._cascades: dict[str, CascadeConfig] = dict(config.cascades)
+        self._tiers: dict[str, list[str]] = {}
+        for name, cascade in self._cascades.items():
+            for tier, chain in ((CascadeTier.CHEAP, cascade.cheap),
+                                (CascadeTier.STRONG, cascade.strong)):
+                key = tier_route(name, tier)
+                self._tiers[key] = self._usable(key, chain)
+
+    def _usable(self, name: str, chain: list[str]) -> list[str]:
+        """Drop disabled providers from a chain.
+
+        Args:
+            name: Route or tier name, for the error message.
+            chain: Configured provider names.
+
+        Returns:
+            The enabled providers, in order.
+
+        Raises:
+            ConfigurationError: If none are enabled.
+        """
+        usable = [p for p in chain if p in self._providers]
+        if not usable:
+            raise ConfigurationError(f"route '{name}' has no enabled providers")
+        return usable
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -142,6 +168,24 @@ class Router:
     def routes(self) -> dict[str, list[str]]:
         """Route alias -> usable provider chain (copy)."""
         return {k: list(v) for k, v in self._routes.items()}
+
+    @property
+    def cascades(self) -> dict[str, dict[str, list[str]]]:
+        """Cascade alias -> {tier: usable provider chain} (copy)."""
+        return {name: {tier.value: list(self._tiers[tier_route(name, tier)])
+                       for tier in CascadeTier}
+                for name in self._cascades}
+
+    def cascade_config(self, name: str) -> CascadeConfig | None:
+        """Return a cascade's policy, or ``None`` if ``name`` is not a cascade.
+
+        Args:
+            name: Resolved alias.
+
+        Returns:
+            The cascade policy or ``None``.
+        """
+        return self._cascades.get(name)
 
     def breaker_states(self) -> dict[str, str]:
         """Provider name -> current circuit state."""
@@ -154,18 +198,18 @@ class Router:
             model: Value of the request's ``model`` field.
 
         Returns:
-            The route alias.
+            The route or cascade alias.
 
         Raises:
-            ModelNotFoundError: If no such route exists.
+            ModelNotFoundError: If no such route or cascade exists.
         """
         if model == "default":
             return self._default_route
-        if model in self._routes:
+        if model in self._routes or model in self._cascades:
             return model
         raise ModelNotFoundError(
             f"model '{model}' is not a configured route",
-            details={"available": sorted(self._routes)},
+            details={"available": sorted([*self._routes, *self._cascades])},
         )
 
     # ------------------------------------------------------------------ #
@@ -300,10 +344,10 @@ class Router:
     # ------------------------------------------------------------------ #
 
     def _chain(self, route: str) -> list[Provider]:
-        try:
-            return [self._providers[name] for name in self._routes[route]]
-        except KeyError as exc:  # resolve() should have caught this
-            raise ModelNotFoundError(f"route '{route}' is not configured") from exc
+        chain = self._routes.get(route) or self._tiers.get(route)
+        if chain is None:  # resolve() should have caught this
+            raise ModelNotFoundError(f"route '{route}' is not configured")
+        return [self._providers[name] for name in chain]
 
     async def _attempt(
         self,
@@ -375,3 +419,16 @@ async def _safe_aclose(iterator: AsyncIterator[StreamChunk]) -> None:
         await aclose()
     except Exception:
         logger.debug("error while closing provider stream", exc_info=True)
+
+
+def tier_route(cascade: str, tier: CascadeTier) -> str:
+    """Internal route name of a cascade tier, e.g. ``"smart:cheap"``.
+
+    Args:
+        cascade: Cascade alias.
+        tier: Tier.
+
+    Returns:
+        The internal route name (also used as the ``route`` metric label).
+    """
+    return f"{cascade}:{tier.value}"

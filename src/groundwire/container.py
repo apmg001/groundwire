@@ -16,6 +16,7 @@ from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.providers.base import Provider
 from groundwire.providers.factory import build_providers, close_providers
+from groundwire.routing.cascade import CascadeRunner
 from groundwire.routing.router import Router
 from groundwire.safety.guard import SafetyGuard
 from groundwire.services.chat import ChatService
@@ -85,8 +86,9 @@ def build_container(
     grounding = verifier or build_verifier(config.grounding)
     guard = safety or SafetyGuard(config.safety, metrics=metrics)
     response_cache = cache or build_cache(config.cache, metrics=metrics)
+    cascade = CascadeRunner(router, grounding, metrics=metrics)
     chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
-                       safety=guard, cache=response_cache)
+                       safety=guard, cache=response_cache, cascade=cascade)
     return Container(config=config, providers=built_providers, metrics=metrics,
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
                      chat=chat)

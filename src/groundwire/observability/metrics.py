@@ -90,6 +90,14 @@ class GatewayMetrics:
         self.cache_tokens_saved = Counter(
             "groundwire_cache_tokens_saved_total",
             "Provider tokens not spent because an answer was served from cache.", registry=r)
+        self.cascade_requests = Counter(
+            "groundwire_cascade_requests_total",
+            "Cascade outcomes: which tier served the answer, and why.",
+            ["cascade", "tier", "reason"], registry=r)
+        self.cascade_check_latency = Histogram(
+            "groundwire_cascade_check_duration_seconds",
+            "Time to fact-check the cheap tier's answer.",
+            ["cascade"], buckets=_LATENCY_BUCKETS, registry=r)
         self.coalesced_requests = Counter(
             "groundwire_coalesced_requests_total",
             "Requests answered by an identical in-flight request.", registry=r)

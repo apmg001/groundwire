@@ -352,6 +352,47 @@ class CacheConfig(_StrictModel):
     namespace: Annotated[str, Field(min_length=1, max_length=64)] = "v1"
 
 
+class CascadeTier(StrEnum):
+    """The two tiers of a cascade."""
+
+    CHEAP = "cheap"
+    STRONG = "strong"
+
+
+class CascadeCheckFailure(StrEnum):
+    """What a cascade does when the fact-check cannot score the cheap answer."""
+
+    ESCALATE = "escalate"  # correctness first: ask the strong tier
+    SERVE_CHEAP = "serve_cheap"  # cost first: deliver the unchecked cheap answer
+
+
+class CascadeConfig(_StrictModel):
+    """Cheap-first routing that escalates when the fact-check fails.
+
+    Measured on RAGTruth (``make bench-cascade-token``): GPT-3.5 -> GPT-4 matched
+    GPT-4's hallucination rate at ~15% of its cost, but Llama-2-7B -> GPT-4 only
+    halved the cost while doubling errors. Savings are capped by how often the
+    cheap tier is right, so enable a cascade only where the cheap model is decent,
+    and watch ``groundwire_cascade_requests_total``.
+
+    Attributes:
+        cheap: Provider chain tried first (normal retries and failover apply).
+        strong: Provider chain used when the cheap answer fails the check.
+        escalate_below: Escalate when the verifier's answer score is below this.
+            Its meaning follows ``grounding.aggregation`` (with LettuceDetect and
+            ``min``: 0.5 = escalate if any token is more likely made up than not).
+        on_check_error: Behaviour when the check cannot run.
+        without_context: Tier for requests that carry no grounding documents
+            (nothing to check against).
+    """
+
+    cheap: Annotated[list[str], Field(min_length=1)]
+    strong: Annotated[list[str], Field(min_length=1)]
+    escalate_below: Annotated[float, Field(ge=0, le=1)] = 0.5
+    on_check_error: CascadeCheckFailure = CascadeCheckFailure.ESCALATE
+    without_context: CascadeTier = CascadeTier.STRONG
+
+
 class GatewayConfig(_StrictModel):
     """Root of the YAML gateway configuration.
 
@@ -360,13 +401,15 @@ class GatewayConfig(_StrictModel):
         routes: Route alias -> ordered fallback chain of provider names.
             Clients select a route via the OpenAI ``model`` field.
         default_route: Route used when a client sends ``model: "default"``
-            or the alias is omitted. Must exist in ``routes``.
+            or the alias is omitted. Must exist in ``routes`` or ``cascades``.
         request_timeout_s: End-to-end deadline across retries and failover.
         retry: Retry policy.
         circuit_breaker: Circuit-breaker policy.
         grounding: Grounding-verification settings.
         safety: Prompt-injection and PII settings.
         cache: Response cache settings.
+        cascades: Cascade alias -> cheap-first routing policy. Clients select a
+            cascade via the ``model`` field, like a route.
     """
 
     providers: Annotated[list[ProviderConfig], Field(min_length=1)]
@@ -378,6 +421,7 @@ class GatewayConfig(_StrictModel):
     grounding: GroundingConfig = GroundingConfig()
     safety: SafetyConfig = SafetyConfig()
     cache: CacheConfig = CacheConfig()
+    cascades: dict[str, CascadeConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:
@@ -399,8 +443,25 @@ class GatewayConfig(_StrictModel):
             if not any(p in enabled for p in chain):
                 raise ValueError(f"route '{route}' has no enabled providers")
 
-        if self.default_route not in self.routes:
-            raise ValueError(f"default_route '{self.default_route}' is not defined in routes")
+        for name, cascade in self.cascades.items():
+            if name in self.routes or name == "default":
+                raise ValueError(f"cascade '{name}' clashes with a route alias")
+            overlap = sorted(set(cascade.cheap) & set(cascade.strong))
+            if overlap:
+                raise ValueError(f"cascade '{name}' lists {overlap} in both tiers")
+            for tier, chain in (("cheap", cascade.cheap), ("strong", cascade.strong)):
+                unknown = [p for p in chain if p not in known]
+                if unknown:
+                    raise ValueError(
+                        f"cascade '{name}' {tier} tier references unknown providers: {unknown}")
+                if len(set(chain)) != len(chain):
+                    raise ValueError(f"cascade '{name}' {tier} tier lists a provider twice")
+                if not any(p in enabled for p in chain):
+                    raise ValueError(f"cascade '{name}' {tier} tier has no enabled providers")
+
+        if self.default_route not in self.routes and self.default_route not in self.cascades:
+            raise ValueError(f"default_route '{self.default_route}' is not defined in routes "
+                             "or cascades")
         return self
 
     def enabled_providers(self) -> list[ProviderConfig]:

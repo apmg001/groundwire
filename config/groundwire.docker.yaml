@@ -110,10 +110,37 @@ providers:
       response_text: "Invoice INV-1042 totals 1,200 USD and is due on 15 March."
       latency_s: 0.02
 
+  # Cascade demo: a "cheap" mock that invents a number and a "strong" mock that doesn't.
+  - name: mock-cheap
+    type: mock
+    model: mock-small
+    mock:
+      response_text: "The refund for order 7781 is 89.99 USD."
+      latency_s: 0.01
+
+  - name: mock-strong
+    type: mock
+    model: mock-large
+    mock:
+      response_text: "The refund for order 7781 is 49.99 USD and was issued on 2 May."
+      latency_s: 0.05
+
 routes:
   # Local first; cloud providers only take over if enabled and local fails.
   default: [llama-local, ollama-local, groq, openai, anthropic]
   # Demonstrates retries, circuit breaking and failover with no network at all.
   demo: [mock-flaky, mock-stable]
+
+# Cheap-first routing: try the cheap tier, fact-check its answer against the request's
+# grounding documents, escalate to the strong tier only if the check fails.
+# Measured on RAGTruth (make bench-cascade-token): pays off only when the cheap model is
+# already decent. Watch groundwire_cascade_requests_total{reason="low_support"}.
+cascades:
+  smart-demo:
+    cheap: [mock-cheap]
+    strong: [mock-strong]
+    escalate_below: 0.5        # with the default lexical scorer: share of supported claims
+    on_check_error: escalate   # escalate | serve_cheap
+    without_context: strong    # no documents to check against -> strong | cheap
 
 default_route: default

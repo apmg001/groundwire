@@ -112,13 +112,12 @@ async def list_models(container: Container = Depends(get_container)) -> dict[str
     Returns:
         OpenAI-style model list.
     """
-    return {
-        "object": "list",
-        "data": [
-            {"id": route, "object": "model", "owned_by": "groundwire", "providers": chain}
-            for route, chain in container.router.routes.items()
-        ],
-    }
+    routes = [{"id": route, "object": "model", "owned_by": "groundwire", "providers": chain}
+              for route, chain in container.router.routes.items()]
+    cascades = [{"id": name, "object": "model", "owned_by": "groundwire",
+                 "providers": tiers["cheap"] + tiers["strong"], "cascade": tiers}
+                for name, tiers in container.router.cascades.items()]
+    return {"object": "list", "data": routes + cascades}
 
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +137,7 @@ async def healthz() -> dict[str, str]:
 
 @router.get("/readyz")
 async def readyz(container: Container = Depends(get_container)) -> JSONResponse:  # noqa: B008
-    """Readiness probe: every route needs at least one non-open circuit.
+    """Readiness probe: every route and cascade needs at least one non-open circuit.
 
     Args:
         container: Injected container.
@@ -150,6 +149,11 @@ async def readyz(container: Container = Depends(get_container)) -> JSONResponse:
     unavailable = [
         route for route, chain in container.router.routes.items()
         if all(states.get(p) == "open" for p in chain)
+    ]
+    # A cascade is down only when both tiers are (either tier can serve alone).
+    unavailable += [
+        name for name, tiers in container.router.cascades.items()
+        if all(states.get(p) == "open" for chain in tiers.values() for p in chain)
     ]
     status_code = 503 if unavailable else 200
     return JSONResponse(

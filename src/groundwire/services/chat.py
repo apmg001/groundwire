@@ -6,6 +6,8 @@ Responsibilities (and nothing else):
 * apply the safety guard (injection screening, PII redaction/restoration),
 * serve from the response cache when possible, and merge identical
   in-flight requests into one provider call,
+* run cascade routes (cheap model first, strong model only when the answer
+  fails the fact-check) through :class:`CascadeRunner`,
 * enforce the end-to-end deadline across retries and failover,
 * run grounding verification when the client asks for it and apply the
   flag/block policy,
@@ -60,7 +62,8 @@ from groundwire.domain.models import (
 )
 from groundwire.guardrails.grounding import GroundingReport, GroundingVerifier, Verdict
 from groundwire.observability.metrics import GatewayMetrics
-from groundwire.routing.router import RoutedCompletion, Router
+from groundwire.routing.cascade import CascadeDecision, CascadeRunner
+from groundwire.routing.router import Router
 from groundwire.safety.guard import PreparedRequest, SafetyGuard
 from groundwire.safety.pii import StreamRestorer
 
@@ -96,11 +99,16 @@ class _Answer:
         completion: The completion (text still contains PII placeholders).
         provider: Who served it (a provider name or ``"cache"``).
         attempts: Provider attempts, as response metadata.
+        cascade: The cascade decision, for cascade routes.
+        report: Grounding report already computed on this answer (a cascade's
+            cheap-tier check), reused instead of checking twice.
     """
 
     completion: Completion
     provider: str
     attempts: list[dict[str, Any]]
+    cascade: CascadeDecision | None = None
+    report: GroundingReport | None = None
 
 
 class ChatService:
@@ -115,6 +123,7 @@ class ChatService:
         request_timeout_s: float,
         safety: SafetyGuard | None = None,
         cache: ResponseCache | None = None,
+        cascade: CascadeRunner | None = None,
     ) -> None:
         """Create the service.
 
@@ -126,6 +135,8 @@ class ChatService:
                 (non-streaming) or the first chunk (streaming).
             safety: Prompt-injection and PII guard; ``None`` disables both.
             cache: Response cache; ``None`` disables caching and coalescing.
+            cascade: Cascade runner (built from ``router`` and ``verifier`` if
+                omitted; it only acts on routes configured as cascades).
         """
         self._router = router
         self._verifier = verifier
@@ -133,7 +144,8 @@ class ChatService:
         self._timeout_s = request_timeout_s
         self._safety = safety
         self._cache = cache
-        self._flights: SingleFlight[RoutedCompletion] = SingleFlight()
+        self._cascade = cascade or CascadeRunner(router, verifier, metrics=metrics)
+        self._flights: SingleFlight[_Answer] = SingleFlight()
 
     # ------------------------------------------------------------------ #
     # Non-streaming
@@ -162,62 +174,87 @@ class ChatService:
         provider = "none"
         status = "error"
         try:
-            prepared = self._prepare(request)
-            lookup = await self._cache_lookup(prepared, route)
-            if lookup is not None and lookup.hit and lookup.entry is not None:
-                answer = _Answer(completion=_completion_from_lookup(lookup),
-                                 provider=CACHE_PROVIDER, attempts=[])
-            else:
-                answer = await self._call_provider(route, prepared, lookup)
-            provider = answer.provider
-
-            text = self._restore(answer.completion.text, prepared)
-            meta: dict[str, Any] = {
-                "route": route,
-                "provider": answer.provider,
-                "upstream_model": answer.completion.upstream_model,
-                "attempts": answer.attempts,
-            }
-            safety_meta = prepared.metadata()
-            if safety_meta:
-                meta["safety"] = safety_meta
-            if lookup is not None:
-                meta["cache"] = lookup.as_dict()
-
-            report: GroundingReport | None = None
-            grounding = request.groundwire.grounding if request.groundwire else None
-            if grounding is not None:
-                # Ground the *restored* answer against the original (unredacted) context.
-                report = await self._check_grounding(text, grounding,
-                                                     _last_user_message(request))
-                meta["grounding"] = report.as_dict()
-
-            if lookup is not None and not lookup.hit and not lookup.coalesced:
-                await self._cache_store(lookup, answer.completion, answer.provider, report)
-
+            response = await self._respond(request, route)
+            provider = str(response.groundwire.get("provider", "none"))
             status = "success"
-            return ChatCompletionResponse(
-                model=request.model,
-                choices=[Choice(message=AssistantMessage(content=text),
-                                finish_reason=answer.completion.finish_reason)],
-                usage=answer.completion.usage,
-                groundwire=meta,
-            )
+            return response
         except GroundwireError as exc:
             status = exc.code
             raise
         finally:
             self._record_request(route, provider, status, stream=False, started=started)
 
-    async def _call_provider(self, route: str, prepared: PreparedRequest,
-                             lookup: CacheLookup | None) -> _Answer:
-        """Call the router under the deadline, coalescing identical requests.
+    async def _respond(self, request: ChatCompletionRequest, route: str
+                       ) -> ChatCompletionResponse:
+        """Build a full (non-streamed) response: safety, cache, routing, grounding.
 
         Args:
-            route: Route alias.
+            request: Client request.
+            route: Resolved route or cascade alias.
+
+        Returns:
+            The response.
+
+        Raises:
+            GroundwireError: Any error :meth:`complete` documents.
+        """
+        prepared = self._prepare(request)
+        lookup = await self._cache_lookup(prepared, route)
+        if lookup is not None and lookup.hit and lookup.entry is not None:
+            answer = _Answer(completion=_completion_from_lookup(lookup),
+                             provider=CACHE_PROVIDER, attempts=[])
+        else:
+            answer = await self._call_provider(route, prepared, lookup, request)
+
+        text = self._restore(answer.completion.text, prepared)
+        meta: dict[str, Any] = {
+            "route": route,
+            "provider": answer.provider,
+            "upstream_model": answer.completion.upstream_model,
+            "attempts": answer.attempts,
+        }
+        if answer.cascade is not None:
+            meta["cascade"] = answer.cascade.as_dict()
+        safety_meta = prepared.metadata()
+        if safety_meta:
+            meta["safety"] = safety_meta
+        if lookup is not None:
+            meta["cache"] = lookup.as_dict()
+
+        report: GroundingReport | None = None
+        grounding = request.groundwire.grounding if request.groundwire else None
+        if grounding is not None:
+            # A coalesced answer was checked with another request's PII values,
+            # so only reuse a precomputed report for our own answer.
+            reusable = None if lookup is not None and lookup.coalesced else answer.report
+            # Ground the *restored* answer against the original (unredacted) context.
+            report = await self._check_grounding(text, grounding, _last_user_message(request),
+                                                 precomputed=reusable)
+            meta["grounding"] = report.as_dict()
+
+        if lookup is not None and not lookup.hit and not lookup.coalesced:
+            await self._cache_store(lookup, answer.completion, answer.provider, report)
+
+        return ChatCompletionResponse(
+            model=request.model,
+            choices=[Choice(message=AssistantMessage(content=text),
+                            finish_reason=answer.completion.finish_reason)],
+            usage=answer.completion.usage,
+            groundwire=meta,
+        )
+
+    async def _call_provider(self, route: str, prepared: PreparedRequest,
+                             lookup: CacheLookup | None,
+                             original: ChatCompletionRequest) -> _Answer:
+        """Call the router (or a cascade) under the deadline, coalescing identical requests.
+
+        Args:
+            route: Route or cascade alias.
             prepared: Safety-processed request.
             lookup: Cache lookup (its key drives coalescing); updated in place
                 when the answer is shared from another in-flight request.
+            original: The client's request (unredacted question and documents
+                for a cascade's fact-check).
 
         Returns:
             The provider's answer.
@@ -227,8 +264,20 @@ class ChatService:
             AllProvidersFailedError: Every provider failed.
             ProviderBadRequestError: Upstream rejected the request.
         """
-        async def call() -> RoutedCompletion:
-            return await self._router.complete(route, prepared.request)
+        async def call() -> _Answer:
+            if self._router.cascade_config(route) is not None:
+                grounding = original.groundwire.grounding if original.groundwire else None
+                outcome = await self._cascade.complete(
+                    route, prepared.request,
+                    context=grounding.context if grounding else None,
+                    question=_last_user_message(original),
+                    restore=lambda text: self._restore(text, prepared))
+                return _Answer(completion=outcome.routed.completion,
+                               provider=outcome.routed.provider, attempts=outcome.attempts,
+                               cascade=outcome.decision, report=outcome.report)
+            routed = await self._router.complete(route, prepared.request)
+            return _Answer(completion=routed.completion, provider=routed.provider,
+                           attempts=[a.as_dict() for a in routed.attempts])
 
         coalesce = (self._cache is not None and self._cache.coalesce and lookup is not None
                     and lookup.key is not None
@@ -236,19 +285,18 @@ class ChatService:
         try:
             async with asyncio.timeout(self._timeout_s):
                 if coalesce and lookup is not None and lookup.key is not None:
-                    routed, shared = await self._flights.run(lookup.key.exact, call)
+                    answer, shared = await self._flights.run(lookup.key.exact, call)
                     if shared:
                         lookup.coalesced = True
                         self._metrics.coalesced_requests.inc()
                 else:
-                    routed = await call()
+                    answer = await call()
         except TimeoutError as exc:
             raise GatewayTimeoutError(
                 f"no provider answered within {self._timeout_s:.0f}s",
                 details={"route": route},
             ) from exc
-        return _Answer(completion=routed.completion, provider=routed.provider,
-                       attempts=[a.as_dict() for a in routed.attempts])
+        return answer
 
     # ------------------------------------------------------------------ #
     # Streaming
@@ -262,6 +310,12 @@ class ChatService:
         proper HTTP error. Failures after that are delivered in-band as an SSE
         ``error`` payload. Cache hits are replayed as a normal SSE stream.
 
+        Cascade routes cannot stream tokens as they are generated: the answer
+        must be complete before it can be fact-checked. They are produced in
+        full, checked, then streamed out; the first token arrives later, but
+        streaming clients keep working, and grounding ``block`` mode is
+        supported because nothing is sent before the check.
+
         Args:
             request: Validated client request with ``stream=True``.
 
@@ -269,20 +323,24 @@ class ChatService:
             The stream session.
 
         Raises:
-            InvalidRequestError: Grounding ``block`` mode requested with streaming.
+            InvalidRequestError: Grounding ``block`` mode requested with streaming
+                on a non-cascade route.
+            GroundingViolationError: Grounding failed in ``block`` mode (cascades).
             ModelNotFoundError: Unknown route.
             GatewayTimeoutError: No stream started before the deadline.
             AllProvidersFailedError: Every provider failed to start a stream.
             PromptInjectionError: Injection detected and the policy is ``block``.
         """
         grounding = request.groundwire.grounding if request.groundwire else None
+        route = self._router.resolve(request.model)
+        if self._router.cascade_config(route) is not None:
+            return await self._stream_buffered(request, route)
         if grounding is not None and grounding.mode is GroundingMode.BLOCK:
             raise InvalidRequestError(
                 "grounding mode 'block' cannot be combined with stream=true: tokens "
                 "are sent before the answer can be verified. Use mode 'flag' or disable streaming."
             )
 
-        route = self._router.resolve(request.model)
         started = time.perf_counter()
         try:
             prepared = self._prepare(request)
@@ -307,6 +365,67 @@ class ChatService:
         events = self._stream_events(request, route, routed.provider, routed.chunks,
                                      grounding, started, prepared, lookup)
         return StreamSession(provider=routed.provider, route=route, events=events)
+
+    async def _stream_buffered(self, request: ChatCompletionRequest,
+                               route: str) -> StreamSession:
+        """Produce the full answer first (cascades), then stream it.
+
+        Args:
+            request: Client request with ``stream=True``.
+            route: Resolved cascade alias.
+
+        Returns:
+            The stream session.
+
+        Raises:
+            GroundwireError: Anything :meth:`complete` raises, before any byte is sent.
+        """
+        started = time.perf_counter()
+        try:
+            response = await self._respond(request, route)
+        except GroundwireError as exc:
+            self._record_request(route, "none", exc.code, stream=True, started=started)
+            raise
+        provider = str(response.groundwire.get("provider", "none"))
+        return StreamSession(provider=provider, route=route,
+                             events=self._replay_response(request, route, response, started))
+
+    async def _replay_response(self, request: ChatCompletionRequest, route: str,
+                               response: ChatCompletionResponse,
+                               started: float) -> AsyncIterator[dict[str, Any]]:
+        """Stream a finished response as OpenAI-style SSE payloads.
+
+        Args:
+            request: Client request.
+            route: Route alias.
+            response: The finished response (text already PII-restored).
+            started: ``perf_counter`` at request start.
+
+        Yields:
+            Content chunks, the finish chunk, then the ``groundwire`` metadata chunk.
+        """
+        stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        provider = str(response.groundwire.get("provider", "none"))
+        choice = response.choices[0]
+        status = "error"
+
+        def stamp(chunk: StreamChunk) -> dict[str, Any]:
+            chunk.id, chunk.created, chunk.model = stream_id, created, request.model
+            return chunk.model_dump(exclude_none=True)
+
+        try:
+            for index, piece in enumerate(_STREAM_PIECE.findall(choice.message.content)):
+                yield stamp(StreamChunk.text(piece, role=index == 0))
+            yield stamp(StreamChunk.finish(choice.finish_reason, response.usage))
+            yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
+                   "model": request.model, "choices": [], "groundwire": response.groundwire}
+            status = "success"
+        except (GeneratorExit, asyncio.CancelledError):
+            status = "client_disconnected"
+            raise
+        finally:
+            self._record_request(route, provider, status, stream=True, started=started)
 
     async def _stream_events(
         self,
@@ -555,13 +674,16 @@ class ChatService:
         await self._cache.store(lookup, completion, provider)
 
     async def _check_grounding(self, answer: str, options: GroundingOptions,
-                               question: str | None = None) -> GroundingReport:
+                               question: str | None = None, *,
+                               precomputed: GroundingReport | None = None) -> GroundingReport:
         """Run grounding and apply the request's policy.
 
         Args:
             answer: Generated text.
             options: Grounding options.
             question: The user's question, for scorers that read the full prompt.
+            precomputed: A report already computed on exactly this answer and
+                context (a cascade's check); the policy is still applied.
 
         Returns:
             The report (when the answer passes, or fails in ``flag`` mode).
@@ -570,7 +692,8 @@ class ChatService:
             GroundingViolationError: Failed in ``block`` mode.
             GuardrailUnavailableError: Scorer failed and policy is fail-closed.
         """
-        report = await self._verifier.verify(answer, options.context, question=question)
+        report = precomputed or await self._verifier.verify(answer, options.context,
+                                                            question=question)
         self._metrics.grounding.labels(verdict=report.verdict.value).inc()
         self._metrics.grounding_latency.observe(report.latency_ms / 1000)
         logger.info("grounding checked", extra={
