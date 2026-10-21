@@ -124,11 +124,24 @@ providers:
       response_text: "The refund for order 7781 is 49.99 USD and was issued on 2 May."
       latency_s: 0.05
 
+  # Agent demo: requests the issue_refund tool when offered, then answers in text.
+  - name: mock-agent
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund for order 7781 has been issued."
+      latency_s: 0.01
+      tool_call:
+        name: issue_refund
+        arguments: {order_id: 7781, amount: 49.99}
+
 routes:
   # Local first; cloud providers only take over if enabled and local fails.
   default: [llama-local, ollama-local, groq, openai, anthropic]
   # Demonstrates retries, circuit breaking and failover with no network at all.
   demo: [mock-flaky, mock-stable]
+  # Tool-calling demo (no API key needed).
+  agent-demo: [mock-agent]
 
 # Cheap-first routing: try the cheap tier, fact-check its answer against the request's
 # grounding documents, escalate to the strong tier only if the check fails.

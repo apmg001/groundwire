@@ -95,6 +95,18 @@ class ProviderType(StrEnum):
     MOCK = "mock"  # deterministic fake for tests, load and chaos testing
 
 
+class MockToolCall(_StrictModel):
+    """A tool call a ``mock`` provider makes when the request offers that tool.
+
+    Attributes:
+        name: Tool (function) name.
+        arguments: Arguments object.
+    """
+
+    name: Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 class MockBehaviour(_StrictModel):
     """Behaviour of a ``mock`` provider.
 
@@ -103,12 +115,15 @@ class MockBehaviour(_StrictModel):
         latency_s: Artificial latency per call.
         failure_rate: Probability in [0, 1] that a call fails with a server error.
         seed: Seed for the failure RNG, for reproducible chaos tests.
+        tool_call: Call this tool when it is offered and the last message is not
+            already a tool result (so an agent loop ends with ``response_text``).
     """
 
     response_text: str = "This is a mock response from Groundwire."
     latency_s: Annotated[float, Field(ge=0, le=60)] = 0.0
     failure_rate: Annotated[float, Field(ge=0, le=1)] = 0.0
     seed: int | None = None
+    tool_call: MockToolCall | None = None
 
 
 class ProviderConfig(_StrictModel):

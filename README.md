@@ -442,6 +442,41 @@ simulation with your own models' answers before relying on the numbers.
 
 ---
 
+## Tool calling (AI agents)
+
+Agents send `tools`, the model answers with `tool_calls`, the agent runs the tool and sends the
+result back as a `tool` message. Groundwire speaks OpenAI's format at the edge and translates it
+for Anthropic (`tool_use` / `tool_result` content blocks, arguments as an object instead of a JSON
+string), so an agent can fail over between providers mid-task.
+
+```bash
+# Try it without an API key: the mock-agent provider requests issue_refund when it is offered.
+curl -sS localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "agent-demo",
+  "messages": [{"role": "user", "content": "Refund order 7781"}],
+  "tools": [{"type": "function", "function": {"name": "issue_refund",
+             "parameters": {"type": "object", "properties": {"order_id": {"type": "integer"}}}}}]
+}'
+```
+
+**Design choices:**
+
+- **Tool calls are assembled before they are forwarded.** Text still streams token by token, but
+  the fragments of a tool call are collected and sent as one complete call just before the finish
+  marker. A half-written call is useless to an agent, and the gateway must see the whole call to
+  restore PII in its arguments (and, next, to apply tool policies).
+- **Tool results are scanned for prompt injection.** Output from tools (emails, web pages, database
+  rows) is untrusted outside data: the main way agents get attacked ("indirect prompt injection").
+- **PII is handled inside the JSON.** Arguments and results are redacted on the way in, and new
+  tool calls are restored on the way out, by decoding the JSON, transforming its strings and
+  encoding it again, so arguments stay valid JSON and the real email reaches the real tool.
+- **Agent traffic bypasses the cache.** Agent turns depend on live tool results and can trigger
+  real actions; replaying a cached "call issue_refund" would be dangerous.
+- **Fact-checking skips tool calls.** A call is a request for action, not a factual claim; tool
+  policies (next) are the right control for calls.
+
+---
+
 ## Quality gates: CI fails if accuracy drops
 
 The benchmark numbers above are enforced, not just reported. `config/quality_gates.yaml` defines
@@ -572,6 +607,8 @@ scripts/          chaos demo
 - [ ] Redis/pgvector cache adapter for multi-replica deployments
 - [x] Benchmark quality gates in CI (fast on every push, model-based weekly/on main)
 - [x] Cascade routing with fact-check escalation, simulated on RAGTruth before it was built
+- [x] Tool calling for agents (OpenAI + Anthropic translation, streamed calls assembled, PII-safe)
+- [ ] Tool-call guardrails: per-tool policies, argument limits, injection lockdown (OWASP LLM06)
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

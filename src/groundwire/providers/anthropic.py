@@ -9,12 +9,18 @@ Differences from the OpenAI format that this adapter hides:
   ``message_delta``, ``message_stop``, ``ping``, ``error``).
 * Stop reasons differ (``end_turn``, ``max_tokens``, ``stop_sequence``...).
 * HTTP 529 means "overloaded" (treated as a retryable server error).
+* Tools: ``{name, description, input_schema}``; ``tool_choice`` types are
+  ``auto``/``any``/``tool``/``none``; a model's call is a ``tool_use`` content
+  block whose ``input`` is a JSON *object* (OpenAI: a JSON *string*); a result
+  goes back as a ``tool_result`` block inside a **user** message. Streaming
+  sends ``content_block_start`` (id, name) then ``input_json_delta`` pieces.
 
 ``base_url`` is the API root, e.g. ``https://api.anthropic.com``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -25,9 +31,17 @@ from pydantic import SecretStr
 from groundwire.core.errors import ProviderResponseError, ProviderServerError
 from groundwire.domain.models import (
     ChatCompletionRequest,
+    ChatMessage,
     Completion,
     FinishReason,
+    FunctionCall,
+    FunctionCallDelta,
+    NamedToolChoice,
+    StreamChoice,
     StreamChunk,
+    StreamDelta,
+    ToolCall,
+    ToolCallDelta,
     Usage,
 )
 from groundwire.providers.base import Provider
@@ -58,6 +72,120 @@ def _finish_reason(value: Any) -> FinishReason | None:
     if value is None:
         return None
     return _STOP_REASON_MAP.get(str(value), "stop")
+
+
+# --------------------------------------------------------------------------- #
+# Format translation (pure functions, unit-tested directly)
+# --------------------------------------------------------------------------- #
+
+Block = dict[str, Any]
+
+
+def _arguments_object(call: ToolCall) -> dict[str, Any]:
+    """Anthropic needs ``input`` as an object; fall back to ``{}`` for bad JSON.
+
+    Args:
+        call: OpenAI-style call (arguments as a JSON string).
+
+    Returns:
+        The arguments object.
+    """
+    parsed = call.parsed_arguments()
+    if parsed is None:
+        logger.warning("tool call arguments are not a JSON object; sending {}",
+                       extra={"tool": call.function.name})
+        return {}
+    return parsed
+
+
+def message_blocks(message: ChatMessage) -> tuple[str, list[Block]]:
+    """Translate one non-system message into an Anthropic role and content blocks.
+
+    Args:
+        message: Domain message (``user``, ``assistant`` or ``tool``).
+
+    Returns:
+        ``(role, blocks)``; ``tool`` results become ``user`` turns.
+    """
+    if message.role == "tool":
+        return "user", [{"type": "tool_result", "tool_use_id": message.tool_call_id,
+                         "content": message.content}]
+    blocks: list[Block] = []
+    if message.content:
+        blocks.append({"type": "text", "text": message.content})
+    for call in message.tool_calls or []:
+        blocks.append({"type": "tool_use", "id": call.id, "name": call.function.name,
+                       "input": _arguments_object(call)})
+    return message.role, blocks
+
+
+def merge_turns(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """Build Anthropic's alternating user/assistant turns.
+
+    Consecutive same-role messages are merged (Anthropic requires alternation),
+    which also groups several ``tool_result`` blocks into one user turn, as the
+    API expects after a parallel tool call.
+
+    Args:
+        messages: Non-system messages, oldest first.
+
+    Returns:
+        Anthropic ``messages``.
+    """
+    turns: list[dict[str, Any]] = []
+    for message in messages:
+        role, blocks = message_blocks(message)
+        if not blocks:
+            continue
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"].extend(blocks)
+        else:
+            turns.append({"role": role, "content": blocks})
+    # Plain-text turns stay strings: smaller payloads, identical meaning.
+    for turn in turns:
+        if all(b["type"] == "text" for b in turn["content"]):
+            turn["content"] = "\n\n".join(b["text"] for b in turn["content"])
+    return turns
+
+
+def tool_choice_payload(request: ChatCompletionRequest) -> dict[str, Any] | None:
+    """Translate ``tool_choice`` / ``parallel_tool_calls``.
+
+    Args:
+        request: Client request.
+
+    Returns:
+        Anthropic ``tool_choice``, or ``None`` to use the default (auto).
+    """
+    choice = request.tool_choice
+    if isinstance(choice, NamedToolChoice):
+        payload: dict[str, Any] = {"type": "tool", "name": choice.name}
+    elif choice == "required":
+        payload = {"type": "any"}
+    elif choice == "none":
+        return {"type": "none"}
+    elif choice == "auto" or request.parallel_tool_calls is False:
+        payload = {"type": "auto"}
+    else:
+        return None
+    if request.parallel_tool_calls is False:
+        payload["disable_parallel_tool_use"] = True
+    return payload
+
+
+def parse_tool_use(blocks: list[Any]) -> list[ToolCall]:
+    """Extract ``tool_use`` blocks as OpenAI-style calls.
+
+    Args:
+        blocks: Response content blocks.
+
+    Returns:
+        Tool calls, with ``input`` serialised to a JSON string.
+    """
+    return [ToolCall(id=str(b.get("id")), function=FunctionCall(
+                name=str(b.get("name", "")),
+                arguments=json.dumps(b.get("input") or {}, ensure_ascii=False)))
+            for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
 
 
 class AnthropicProvider(Provider):
@@ -112,14 +240,7 @@ class AnthropicProvider(Provider):
             JSON-serialisable body.
         """
         system_parts = [m.content for m in request.messages if m.role == "system"]
-        merged: list[dict[str, str]] = []
-        for msg in request.messages:
-            if msg.role == "system":
-                continue
-            if merged and merged[-1]["role"] == msg.role:
-                merged[-1]["content"] += "\n\n" + msg.content
-            else:
-                merged.append({"role": msg.role, "content": msg.content})
+        merged = merge_turns([m for m in request.messages if m.role != "system"])
         if not merged:
             # Only system messages were sent; Anthropic needs a user turn.
             merged.append({"role": "user", "content": "Continue."})
@@ -132,6 +253,14 @@ class AnthropicProvider(Provider):
         }
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
+        if request.tools:
+            payload["tools"] = [{"name": t.function.name,
+                                 "description": t.function.description or "",
+                                 "input_schema": t.function.parameters}
+                                for t in request.tools]
+            choice = tool_choice_payload(request)
+            if choice is not None:
+                payload["tool_choice"] = choice
         optional = {
             "temperature": None if request.temperature is None else min(request.temperature, 1.0),
             "top_p": request.top_p,
@@ -168,6 +297,7 @@ class AnthropicProvider(Provider):
             usage=Usage.of(int(usage_raw.get("input_tokens") or 0),
                            int(usage_raw.get("output_tokens") or 0)),
             upstream_model=str(data.get("model") or self.model),
+            tool_calls=parse_tool_use(blocks),
         )
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[StreamChunk]:
@@ -177,6 +307,8 @@ class AnthropicProvider(Provider):
         output_tokens = 0
         finish: FinishReason | None = None
         first = True
+        # Anthropic block index -> OpenAI tool-call index (0, 1, 2... per turn).
+        tool_index: dict[int, int] = {}
 
         with translate_transport_errors(self.name):
             async with self._client.stream("POST", "/v1/messages", json=payload) as response:
@@ -188,11 +320,28 @@ class AnthropicProvider(Provider):
                     if kind == "message_start":
                         usage = (data.get("message") or {}).get("usage") or {}
                         input_tokens = int(usage.get("input_tokens") or 0)
+                    elif kind == "content_block_start":
+                        block = data.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            index = tool_index.setdefault(int(data.get("index", 0)),
+                                                          len(tool_index))
+                            yield _tool_chunk(ToolCallDelta(
+                                index=index, id=str(block.get("id")), type="function",
+                                function=FunctionCallDelta(name=str(block.get("name", "")),
+                                                           arguments="")), role=first)
+                            first = False
                     elif kind == "content_block_delta":
                         delta = data.get("delta") or {}
                         if delta.get("type") == "text_delta" and delta.get("text"):
                             yield StreamChunk.text(str(delta["text"]), role=first)
                             first = False
+                        elif delta.get("type") == "input_json_delta":
+                            block_index = int(data.get("index", 0))
+                            if block_index in tool_index and delta.get("partial_json"):
+                                yield _tool_chunk(ToolCallDelta(
+                                    index=tool_index[block_index],
+                                    function=FunctionCallDelta(
+                                        arguments=str(delta["partial_json"]))), role=False)
                     elif kind == "message_delta":
                         finish = _finish_reason((data.get("delta") or {}).get("stop_reason"))
                         output_tokens = int((data.get("usage") or {}).get("output_tokens") or 0)
@@ -205,10 +354,24 @@ class AnthropicProvider(Provider):
                             f"{self.name}: stream error {err.get('type')}: {err.get('message')}",
                             provider=self.name,
                         )
-                    # ping, content_block_start/stop and unknown events are ignored.
+                    # ping, content_block_stop and unknown events are ignored.
 
         yield StreamChunk.finish(finish or "stop", Usage.of(input_tokens, output_tokens))
 
     async def aclose(self) -> None:
         """Close the HTTP connection pool."""
         await self._client.aclose()
+
+
+def _tool_chunk(delta: ToolCallDelta, *, role: bool) -> StreamChunk:
+    """Wrap one tool-call fragment in a stream chunk.
+
+    Args:
+        delta: Fragment.
+        role: Include ``role: assistant`` (first chunk of the turn).
+
+    Returns:
+        The chunk.
+    """
+    return StreamChunk(choices=[StreamChoice(delta=StreamDelta(
+        role="assistant" if role else None, tool_calls=[delta]))])

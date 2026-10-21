@@ -5,6 +5,11 @@ OpenAI's wire format: OpenAI itself, llama.cpp's ``llama-server``, Ollama's
 ``/v1`` endpoint, vLLM, LM Studio, Groq, Together, OpenRouter...
 
 ``base_url`` must include the version prefix, e.g. ``http://localhost:8080/v1``.
+
+Tool calling is OpenAI's own format, so it passes through with validation:
+``tools``/``tool_choice`` go upstream unchanged, ``message.tool_calls`` are
+parsed into domain objects, and streamed ``delta.tool_calls`` fragments are
+forwarded for the service to assemble.
 """
 
 from __future__ import annotations
@@ -14,14 +19,19 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import httpx
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from groundwire.core.errors import ProviderResponseError
 from groundwire.domain.models import (
     ChatCompletionRequest,
     Completion,
     FinishReason,
+    NamedToolChoice,
+    StreamChoice,
     StreamChunk,
+    StreamDelta,
+    ToolCall,
+    ToolCallDelta,
     Usage,
 )
 from groundwire.providers.base import Provider
@@ -44,6 +54,51 @@ def _finish_reason(value: Any) -> FinishReason | None:
     if value is None:
         return None
     return cast(FinishReason, value) if value in _KNOWN_FINISH else "stop"
+
+
+def _tool_calls(name: str, raw: Any) -> list[ToolCall]:
+    """Parse ``message.tool_calls`` from an upstream response.
+
+    Args:
+        name: Provider name, for errors.
+        raw: The raw ``tool_calls`` value.
+
+    Returns:
+        Parsed calls (empty if absent).
+
+    Raises:
+        ProviderResponseError: If present but malformed.
+    """
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ProviderResponseError(f"{name}: tool_calls is not a list", provider=name)
+    try:
+        return [ToolCall.model_validate(item) for item in raw]
+    except ValidationError as exc:
+        raise ProviderResponseError(f"{name}: malformed tool_calls: {exc.error_count()} errors",
+                                    provider=name) from exc
+
+
+def _tool_call_deltas(name: str, raw: Any) -> list[ToolCallDelta]:
+    """Parse streamed ``delta.tool_calls`` fragments.
+
+    Args:
+        name: Provider name, for errors.
+        raw: The raw fragments.
+
+    Returns:
+        Parsed fragments (empty if absent).
+
+    Raises:
+        ProviderResponseError: If present but malformed.
+    """
+    if not raw:
+        return []
+    try:
+        return [ToolCallDelta.model_validate(item) for item in raw]
+    except (ValidationError, TypeError) as exc:
+        raise ProviderResponseError(f"{name}: malformed tool_call delta", provider=name) from exc
 
 
 def _usage(raw: Any) -> Usage:
@@ -105,9 +160,17 @@ class OpenAICompatibleProvider(Provider):
         """
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [m.model_dump() for m in request.messages],
+            "messages": [m.to_openai() for m in request.messages],
             "stream": stream,
         }
+        if request.tools:
+            payload["tools"] = [t.model_dump(exclude_none=True) for t in request.tools]
+        if request.tool_choice is not None:
+            choice = request.tool_choice
+            payload["tool_choice"] = (choice.model_dump() if isinstance(choice, NamedToolChoice)
+                                      else choice)
+        if request.parallel_tool_calls is not None and request.tools:
+            payload["parallel_tool_calls"] = request.parallel_tool_calls
         optional = {
             "temperature": request.temperature,
             "top_p": request.top_p,
@@ -135,17 +198,24 @@ class OpenAICompatibleProvider(Provider):
 
         try:
             choice = data["choices"][0]
-            text = choice["message"].get("content") or ""
+            message = choice["message"]
+            text = message.get("content") or ""
+            raw_calls = message.get("tool_calls")
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ProviderResponseError(
                 f"{self.name}: response missing choices[0].message", provider=self.name
             ) from exc
 
+        calls = _tool_calls(self.name, raw_calls)
+        finish = _finish_reason(choice.get("finish_reason")) or "stop"
+        if calls and finish == "stop":
+            finish = "tool_calls"  # some servers (older llama.cpp, Ollama) report "stop"
         return Completion(
             text=text,
-            finish_reason=_finish_reason(choice.get("finish_reason")) or "stop",
+            finish_reason=finish,
             usage=_usage(data.get("usage")),
             upstream_model=str(data.get("model") or self.model),
+            tool_calls=calls,
         )
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[StreamChunk]:
@@ -186,6 +256,12 @@ class OpenAICompatibleProvider(Provider):
         delta = choice.get("delta") or {}
         content = delta.get("content")
         finish = _finish_reason(choice.get("finish_reason"))
+        tool_deltas = _tool_call_deltas(self.name, delta.get("tool_calls"))
+        if tool_deltas:
+            return StreamChunk(usage=usage, choices=[StreamChoice(
+                delta=StreamDelta(role="assistant" if first else None, content=content or None,
+                                  tool_calls=tool_deltas),
+                finish_reason=finish)])
         if finish is not None:
             if content:
                 # Rare, but some servers put the last text in the finish chunk.

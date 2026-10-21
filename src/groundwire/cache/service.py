@@ -14,6 +14,7 @@ Lookup order for an eligible request:
 What is never cached:
 
 * requests the client marks ``bypass`` (``refresh`` skips only the read),
+* agent traffic (tools offered, or tool calls/results in the history),
 * requests sampled hotter than ``max_temperature`` (the caller wants variety),
 * requests whose prompt was **flagged as a possible injection** (stops an
   attacker from planting an answer that other users would then receive),
@@ -335,6 +336,10 @@ class ResponseCache:
         """
         if _cache_mode(request) is CacheMode.BYPASS:
             return "client_bypass"
+        if request.uses_tools:
+            # Agent turns depend on live tool results and can trigger actions;
+            # replaying a cached "call issue_refund" would be dangerous.
+            return "tool_use"
         if injection_flagged:
             return "injection_flagged"
         limit = self._config.max_temperature

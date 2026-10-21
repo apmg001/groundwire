@@ -58,6 +58,8 @@ from groundwire.domain.models import (
     GroundingMode,
     GroundingOptions,
     StreamChunk,
+    ToolCall,
+    ToolCallAssembler,
     Usage,
 )
 from groundwire.guardrails.grounding import GroundingReport, GroundingVerifier, Verdict
@@ -207,6 +209,7 @@ class ChatService:
             answer = await self._call_provider(route, prepared, lookup, request)
 
         text = self._restore(answer.completion.text, prepared)
+        calls = self._restore_calls(answer.completion.tool_calls, prepared)
         meta: dict[str, Any] = {
             "route": route,
             "provider": answer.provider,
@@ -223,7 +226,11 @@ class ChatService:
 
         report: GroundingReport | None = None
         grounding = request.groundwire.grounding if request.groundwire else None
-        if grounding is not None:
+        if grounding is not None and calls and not text.strip():
+            # A tool call is a request for action, not a factual claim: nothing
+            # to check against documents (tool policies govern calls instead).
+            meta["grounding"] = {"verdict": "skipped", "reason": "tool_calls"}
+        elif grounding is not None:
             # A coalesced answer was checked with another request's PII values,
             # so only reuse a precomputed report for our own answer.
             reusable = None if lookup is not None and lookup.coalesced else answer.report
@@ -237,7 +244,9 @@ class ChatService:
 
         return ChatCompletionResponse(
             model=request.model,
-            choices=[Choice(message=AssistantMessage(content=text),
+            choices=[Choice(message=AssistantMessage(
+                                content=text if text or not calls else None,
+                                tool_calls=calls or None),
                             finish_reason=answer.completion.finish_reason)],
             usage=answer.completion.usage,
             groundwire=meta,
@@ -415,8 +424,11 @@ class ChatService:
             return chunk.model_dump(exclude_none=True)
 
         try:
-            for index, piece in enumerate(_STREAM_PIECE.findall(choice.message.content)):
+            pieces = _STREAM_PIECE.findall(choice.message.content or "")
+            for index, piece in enumerate(pieces):
                 yield stamp(StreamChunk.text(piece, role=index == 0))
+            if choice.message.tool_calls:
+                yield stamp(StreamChunk.tool_calls(choice.message.tool_calls, role=not pieces))
             yield stamp(StreamChunk.finish(choice.finish_reason, response.usage))
             yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
                    "model": request.model, "choices": [], "groundwire": response.groundwire}
@@ -463,11 +475,31 @@ class ChatService:
         status = "error"
         restorer: StreamRestorer | None = (self._safety.stream_restorer(prepared)
                                            if self._safety else None)
+        # Text streams live; tool calls are assembled and sent once complete
+        # (a partial call is useless to an agent and cannot be checked).
+        assembler = ToolCallAssembler()
+        calls: list[ToolCall] = []
+        sent_text = False
+
+        def release_calls() -> dict[str, Any] | None:
+            nonlocal calls
+            if not assembler or calls:
+                return None
+            calls = self._restore_calls(assembler.calls(), prepared)
+            return StreamChunk.tool_calls(calls, role=not sent_text).model_copy(update={
+                "id": stream_id, "created": created, "model": request.model,
+            }).model_dump(exclude_none=True)
+
         try:
             async for chunk in chunks:
                 if chunk.model:
                     upstream_model = chunk.model
                 chunk.id, chunk.created, chunk.model = stream_id, created, request.model
+                deltas = chunk.tool_call_deltas()
+                if deltas:
+                    assembler.feed(deltas)
+                    for choice in chunk.choices:
+                        choice.delta.tool_calls = None
                 raw_parts.append(chunk.content())
                 for choice in chunk.choices:
                     finish_reason = choice.finish_reason or finish_reason
@@ -482,8 +514,13 @@ class ChatService:
                             delta.content = (delta.content or "") + tail
                 if grounding is not None:
                     parts.append(chunk.content())
-                if chunk.content() or chunk.usage or any(
-                        c.finish_reason is not None for c in chunk.choices):
+                finishing = any(c.finish_reason is not None for c in chunk.choices)
+                if finishing:
+                    ready = release_calls()  # complete calls go out before the finish marker
+                    if ready is not None:
+                        yield ready
+                if chunk.content() or chunk.usage or finishing:
+                    sent_text = sent_text or bool(chunk.content())
                     yield chunk.model_dump(exclude_none=True)
 
             if restorer is not None:
@@ -493,9 +530,13 @@ class ChatService:
                     yield StreamChunk.text(tail).model_copy(update={
                         "id": stream_id, "created": created, "model": request.model,
                     }).model_dump(exclude_none=True)
+            ready = release_calls()  # stream ended without a finish marker
+            if ready is not None:
+                yield ready
 
             report: GroundingReport | None = None
-            if grounding is not None:
+            tool_only = bool(calls) and not "".join(parts).strip()
+            if grounding is not None and not tool_only:
                 report = await self._check_grounding("".join(parts), grounding,
                                                      _last_user_message(request))
             if lookup is not None:
@@ -504,6 +545,9 @@ class ChatService:
                                        usage=usage, upstream_model=upstream_model),
                     provider, report)
             extra = self._stream_metadata(route, provider, prepared, lookup, report)
+            if grounding is not None and tool_only:
+                extra = extra or {"route": route, "provider": provider}
+                extra["grounding"] = {"verdict": "skipped", "reason": "tool_calls"}
             if extra is not None:
                 yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
                        "model": request.model, "choices": [], "groundwire": extra}
@@ -628,6 +672,18 @@ class ChatService:
             return PreparedRequest(request=request)
         grounding = request.groundwire.grounding if request.groundwire else None
         return self._safety.prepare(request, grounding.context if grounding else None)
+
+    def _restore_calls(self, calls: list[ToolCall], prepared: PreparedRequest) -> list[ToolCall]:
+        """Put real PII values back into tool-call arguments.
+
+        Args:
+            calls: Tool calls in redacted form.
+            prepared: Safety-processed request holding the vault.
+
+        Returns:
+            The calls the client should see.
+        """
+        return self._safety.restore_tool_calls(calls, prepared) if self._safety else calls
 
     def _restore(self, text: str, prepared: PreparedRequest) -> str:
         """Put real PII values back into an answer.

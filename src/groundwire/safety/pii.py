@@ -26,13 +26,15 @@ free-text secrets; plug a NER-based :class:`PIIDetector` in for those.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +371,63 @@ class StreamRestorer:
         """
         ready, self._buffer = self._buffer, ""
         return PIIRedactor.restore(ready, self._vault)
+
+
+# --------------------------------------------------------------------------- #
+# JSON (tool-call arguments)
+# --------------------------------------------------------------------------- #
+
+
+def _map_json(value: Any, transform: Callable[[str], str]) -> Any:
+    """Apply ``transform`` to every string (and number) inside a JSON value.
+
+    Numbers are included because identifiers are often sent as numbers
+    (``{"aadhaar": 234123412346}``); a changed number becomes a string, since a
+    placeholder is not a number.
+
+    Args:
+        value: Decoded JSON value.
+        transform: Text transformation.
+
+    Returns:
+        The transformed value.
+    """
+    if isinstance(value, str):
+        return transform(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int | float):
+        text = str(value)
+        changed = transform(text)
+        return value if changed == text else changed
+    if isinstance(value, list):
+        return [_map_json(item, transform) for item in value]
+    if isinstance(value, dict):
+        return {key: _map_json(item, transform) for key, item in value.items()}
+    return value
+
+
+def transform_json_text(text: str, transform: Callable[[str], str]) -> str:
+    """Apply a text transform inside a JSON document without breaking it.
+
+    Tool-call arguments are JSON strings. Redacting or restoring them as raw
+    text could break the JSON (a value containing a quote, or a placeholder
+    replacing a bare number), so the document is decoded, the strings are
+    transformed, and it is encoded again. Text that is not valid JSON is
+    transformed as plain text, since there is no structure to protect.
+
+    Args:
+        text: JSON text.
+        transform: Text transformation (redact or restore).
+
+    Returns:
+        Transformed JSON text.
+    """
+    try:
+        decoded = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return transform(text)
+    return json.dumps(_map_json(decoded, transform), ensure_ascii=False)
 
 
 def redact_all(redactor: PIIRedactor, texts: Sequence[str], vault: PIIVault) -> list[str]:

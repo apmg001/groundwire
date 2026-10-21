@@ -18,6 +18,16 @@ Order matters:
    prompts (RAG apps often paste customer records there).
 3. Grounding context is *not* redacted: it never leaves the gateway, and the
    fact-checker needs the real values to compare against the restored answer.
+
+Agents add two paths that need the same care:
+
+* **Tool results** (``tool`` messages) are untrusted external data, like a web
+  page or an email body, so they are scanned for *indirect* injection (when
+  ``scan_context`` is on) and redacted like any other message.
+* **Tool-call arguments** in the history are redacted, and arguments in the
+  model's new tool calls are restored, so the real email reaches the real
+  tool while the provider only ever saw ``[EMAIL_1]``. Both are done inside
+  the JSON, so the arguments stay valid JSON.
 """
 
 from __future__ import annotations
@@ -28,7 +38,7 @@ from typing import Any
 
 from groundwire.core.config import InjectionDetectorType, SafetyAction, SafetyConfig
 from groundwire.core.errors import GuardrailUnavailableError, PromptInjectionError
-from groundwire.domain.models import ChatCompletionRequest
+from groundwire.domain.models import ChatCompletionRequest, ChatMessage, FunctionCall, ToolCall
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.safety.injection import (
     ClassifierInjectionDetector,
@@ -37,7 +47,14 @@ from groundwire.safety.injection import (
     InjectionDetector,
     InjectionReport,
 )
-from groundwire.safety.pii import PIIRedactor, PIIType, PIIVault, RegexPIIDetector, StreamRestorer
+from groundwire.safety.pii import (
+    PIIRedactor,
+    PIIType,
+    PIIVault,
+    RegexPIIDetector,
+    StreamRestorer,
+    transform_json_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,11 +140,8 @@ class SafetyGuard:
             prepared.injection_action = self._apply_injection_policy(prepared.injection)
 
         if self._redactor is not None:
-            redacted_messages = [
-                message.model_copy(update={"content": self._redactor.redact(message.content,
-                                                                            prepared.vault)})
-                for message in request.messages
-            ]
+            redacted_messages = [self._redact_message(message, prepared.vault)
+                                 for message in request.messages]
             if prepared.vault:
                 prepared.request = request.model_copy(update={"messages": redacted_messages})
                 counts = prepared.vault.counts()
@@ -136,6 +150,28 @@ class SafetyGuard:
                     for pii_type, count in counts.items():
                         self._metrics.pii_redactions.labels(type=pii_type).inc(count)
         return prepared
+
+    def _redact_message(self, message: ChatMessage, vault: PIIVault) -> ChatMessage:
+        """Redact a message's text and any tool-call arguments it carries.
+
+        Args:
+            message: Message.
+            vault: Request vault (updated in place).
+
+        Returns:
+            The redacted copy.
+        """
+        assert self._redactor is not None  # guarded by caller
+        redactor = self._redactor
+        update: dict[str, object] = {"content": redactor.redact(message.content, vault)}
+        if message.tool_calls:
+            update["tool_calls"] = [
+                call.model_copy(update={"function": FunctionCall(
+                    name=call.function.name,
+                    arguments=transform_json_text(call.function.arguments,
+                                                  lambda text: redactor.redact(text, vault)))})
+                for call in message.tool_calls]
+        return message.model_copy(update=update)
 
     def _scan(self, request: ChatCompletionRequest, context: list[str]) -> InjectionReport:
         assert self._detector is not None  # guarded by caller
@@ -149,6 +185,10 @@ class SafetyGuard:
             if settings.scan_context:
                 for document in context:
                     report.merge(self._detector.scan(document, source="context"))
+                # Tool results are outside data too: the main way agents get attacked.
+                for message in request.messages:
+                    if message.role == "tool" and message.content:
+                        report.merge(self._detector.scan(message.content, source="tool"))
         except GuardrailUnavailableError:
             logger.exception("injection detector failed; refusing request")
             raise
@@ -190,6 +230,26 @@ class SafetyGuard:
         if not self._config.pii.restore_output:
             return text
         return PIIRedactor.restore(text, prepared.vault)
+
+    def restore_tool_calls(self, calls: list[ToolCall],
+                           prepared: PreparedRequest) -> list[ToolCall]:
+        """Put original PII values back into tool-call arguments (JSON-safe).
+
+        Args:
+            calls: Tool calls from the model.
+            prepared: The prepared request.
+
+        Returns:
+            Restored calls (unchanged if nothing was redacted).
+        """
+        if not calls or not prepared.vault or not self._config.pii.restore_output:
+            return calls
+        return [call.model_copy(update={"function": FunctionCall(
+                    name=call.function.name,
+                    arguments=transform_json_text(
+                        call.function.arguments,
+                        lambda text: PIIRedactor.restore(text, prepared.vault)))})
+                for call in calls]
 
     def stream_restorer(self, prepared: PreparedRequest) -> StreamRestorer | None:
         """Create a restorer for streaming output.

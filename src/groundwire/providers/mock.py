@@ -6,19 +6,29 @@ Used for three things:
 * load testing the gateway itself (so you measure gateway overhead, not a
   laptop CPU generating tokens),
 * chaos testing: ``failure_rate`` injects transient server errors so you can
-  watch retries, circuit breakers and failover work under real traffic.
+  watch retries, circuit breakers and failover work under real traffic,
+* agent demos: ``tool_call`` makes it request a tool, like a real model would.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import uuid
 from collections.abc import AsyncIterator
 
 from groundwire.core.config import MockBehaviour
 from groundwire.core.errors import ProviderServerError
-from groundwire.domain.models import ChatCompletionRequest, Completion, StreamChunk, Usage
+from groundwire.domain.models import (
+    ChatCompletionRequest,
+    Completion,
+    FunctionCall,
+    StreamChunk,
+    ToolCall,
+    Usage,
+)
 from groundwire.providers.base import Provider
 
 logger = logging.getLogger(__name__)
@@ -62,15 +72,43 @@ class MockProvider(Provider):
         prompt = sum(_approx_tokens(m.content) for m in request.messages)
         return Usage.of(prompt, _approx_tokens(self._behaviour.response_text))
 
+    def _tool_call(self, request: ChatCompletionRequest) -> ToolCall | None:
+        """Decide whether to answer with the configured tool call.
+
+        Args:
+            request: Client request.
+
+        Returns:
+            The call, or ``None`` to answer with text.
+        """
+        planned = self._behaviour.tool_call
+        if planned is None or request.tool_choice == "none" or not request.tools:
+            return None
+        if planned.name not in {t.function.name for t in request.tools}:
+            return None
+        if request.messages[-1].role == "tool":
+            return None  # the tool already ran: finish the loop with text
+        return ToolCall(id=f"call_{uuid.uuid4().hex[:24]}", function=FunctionCall(
+            name=planned.name, arguments=json.dumps(planned.arguments)))
+
     async def complete(self, request: ChatCompletionRequest) -> Completion:
-        """Return the configured text. See :meth:`Provider.complete`."""
+        """Return the configured text or tool call. See :meth:`Provider.complete`."""
         await self._simulate()
+        call = self._tool_call(request)
+        if call is not None:
+            return Completion(text="", finish_reason="tool_calls", tool_calls=[call],
+                              usage=self._usage(request), upstream_model=self.model)
         return Completion(text=self._behaviour.response_text, finish_reason="stop",
                           usage=self._usage(request), upstream_model=self.model)
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[StreamChunk]:
         """Stream the configured text word by word. See :meth:`Provider.stream`."""
         await self._simulate()
+        call = self._tool_call(request)
+        if call is not None:
+            yield StreamChunk.tool_calls([call], role=True)
+            yield StreamChunk.finish("tool_calls", self._usage(request))
+            return
         words = self._behaviour.response_text.split(" ")
         for i, word in enumerate(words):
             yield StreamChunk.text(word if i == 0 else " " + word, role=i == 0)
