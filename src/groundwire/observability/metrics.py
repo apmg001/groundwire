@@ -98,6 +98,11 @@ class GatewayMetrics:
             "groundwire_cascade_check_duration_seconds",
             "Time to fact-check the cheap tier's answer.",
             ["cascade"], buckets=_LATENCY_BUCKETS, registry=r)
+        # Labelled by decision and reason only: tool names come from clients, so
+        # a per-tool label would have unbounded cardinality.
+        self.tool_calls = Counter(
+            "groundwire_tool_calls_total", "Tool calls requested by models, by policy verdict.",
+            ["decision", "reason"], registry=r)
         self.coalesced_requests = Counter(
             "groundwire_coalesced_requests_total",
             "Requests answered by an identical in-flight request.", registry=r)

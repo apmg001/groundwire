@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Self
@@ -367,6 +368,103 @@ class CacheConfig(_StrictModel):
     namespace: Annotated[str, Field(min_length=1, max_length=64)] = "v1"
 
 
+class ToolAction(StrEnum):
+    """What a tool rule does with a matching call."""
+
+    ALLOW = "allow"
+    BLOCK = "block"
+
+
+class ToolViolationHandling(StrEnum):
+    """What the gateway does with a blocked tool call."""
+
+    DROP = "drop"  # remove the call; other calls continue; text explains if none remain
+    ERROR = "error"  # refuse the whole response (HTTP 422 tool_call_blocked)
+
+
+class ArgumentConstraint(_StrictModel):
+    """Limits on one argument (all set limits must hold).
+
+    Attributes:
+        required: The argument must be present.
+        min: Smallest allowed number.
+        max: Largest allowed number.
+        enum: Allowed values.
+        pattern: Regular expression the whole string value must match.
+        max_length: Longest allowed string.
+    """
+
+    required: bool = False
+    min: float | None = None
+    max: float | None = None
+    enum: list[Any] | None = None
+    pattern: str | None = None
+    max_length: Annotated[int, Field(ge=0)] | None = None
+
+    @field_validator("pattern")
+    @classmethod
+    def _valid_regex(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"invalid regular expression {value!r}: {exc}") from exc
+        return value
+
+    @model_validator(mode="after")
+    def _check_range(self) -> Self:
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError(f"min ({self.min}) is greater than max ({self.max})")
+        return self
+
+
+class ToolRule(_StrictModel):
+    """One ordered rule; the first rule whose pattern matches a tool decides.
+
+    Attributes:
+        tools: Tool-name patterns (shell-style: ``*``, ``?``, ``[abc]``).
+        action: Allow or block matching calls.
+        arguments: Argument name (dotted path for nested values) -> limits.
+            Only checked for allowed calls.
+        name: Label shown in audit logs and response metadata.
+    """
+
+    tools: Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)]
+    action: ToolAction = ToolAction.ALLOW
+    arguments: dict[str, ArgumentConstraint] = Field(default_factory=dict)
+    name: Annotated[str, Field(max_length=64)] | None = None
+
+
+class ToolPolicyConfig(_StrictModel):
+    """Guardrails for tool calls requested by models (OWASP LLM06, LLM10).
+
+    Checked in code on every tool call, before the agent receives it, so the
+    model can neither forget nor be talked out of them.
+
+    Attributes:
+        enabled: Turn enforcement on.
+        rules: Ordered rules; the first matching rule decides.
+        default_action: Action when no rule matches.
+        on_violation: Drop blocked calls (agent continues) or refuse the response.
+        injection_lockdown: When the request contains a suspected prompt
+            injection, block every tool call (text answers still go through).
+        max_tool_rounds: Assistant tool-call turns allowed in one conversation
+            before further calls are blocked (stops runaway agent loops).
+        validate_arguments: Check arguments are a JSON object matching the
+            tool's declared JSON Schema (types, required, enum, ranges).
+        reject_unknown_tools: Block calls to tools the request did not offer.
+    """
+
+    enabled: bool = True
+    rules: list[ToolRule] = Field(default_factory=list)
+    default_action: ToolAction = ToolAction.ALLOW
+    on_violation: ToolViolationHandling = ToolViolationHandling.DROP
+    injection_lockdown: bool = True
+    max_tool_rounds: Annotated[int, Field(ge=1, le=1000)] = 25
+    validate_arguments: bool = True
+    reject_unknown_tools: bool = True
+
+
 class CascadeTier(StrEnum):
     """The two tiers of a cascade."""
 
@@ -425,6 +523,7 @@ class GatewayConfig(_StrictModel):
         cache: Response cache settings.
         cascades: Cascade alias -> cheap-first routing policy. Clients select a
             cascade via the ``model`` field, like a route.
+        tool_policy: Guardrails for tool calls made by agents.
     """
 
     providers: Annotated[list[ProviderConfig], Field(min_length=1)]
@@ -437,6 +536,7 @@ class GatewayConfig(_StrictModel):
     safety: SafetyConfig = SafetyConfig()
     cache: CacheConfig = CacheConfig()
     cascades: dict[str, CascadeConfig] = Field(default_factory=dict)
+    tool_policy: ToolPolicyConfig = ToolPolicyConfig()
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:

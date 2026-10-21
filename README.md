@@ -464,7 +464,7 @@ curl -sS localhost:8000/v1/chat/completions -H 'content-type: application/json' 
 - **Tool calls are assembled before they are forwarded.** Text still streams token by token, but
   the fragments of a tool call are collected and sent as one complete call just before the finish
   marker. A half-written call is useless to an agent, and the gateway must see the whole call to
-  restore PII in its arguments (and, next, to apply tool policies).
+  restore PII in its arguments and to apply tool policies.
 - **Tool results are scanned for prompt injection.** Output from tools (emails, web pages, database
   rows) is untrusted outside data: the main way agents get attacked ("indirect prompt injection").
 - **PII is handled inside the JSON.** Arguments and results are redacted on the way in, and new
@@ -473,7 +473,57 @@ curl -sS localhost:8000/v1/chat/completions -H 'content-type: application/json' 
 - **Agent traffic bypasses the cache.** Agent turns depend on live tool results and can trigger
   real actions; replaying a cached "call issue_refund" would be dangerous.
 - **Fact-checking skips tool calls.** A call is a request for action, not a factual claim; tool
-  policies (next) are the right control for calls.
+  policies (below) are the right control for calls.
+
+---
+
+## Tool-call guardrails (OWASP LLM06: Excessive Agency)
+
+The model only *proposes* an action; Groundwire *decides*, in code, before the agent receives it.
+Rules in a system prompt are suggestions a model can forget or be talked out of; checks in the
+gateway cannot. Every tool call goes through these checks (the first failure blocks it):
+
+| Check | Stops |
+|---|---|
+| **Injection lockdown** | Any tool call in a request containing a suspected prompt injection (user message, document or tool result). Text answers still go through. |
+| **Loop limit** (`max_tool_rounds`) | Agents stuck calling tools forever (OWASP LLM10) |
+| **Unknown tool** | Calls to tools the request never offered (models invent tool names) |
+| **Rules** (first match wins, `*` wildcards) | `delete_*` → block; `default_action: block` turns the rules into an allowlist |
+| **Arguments match the tool's schema** | Wrong types, missing required fields, unexpected arguments |
+| **Argument limits** | `issue_refund.amount ≤ 5000`; `send_email.to` must match `@ourco.com` |
+
+```yaml
+tool_policy:
+  rules:
+    - name: refund-cap
+      tools: [issue_refund]
+      arguments: {amount: {max: 5000}}
+    - tools: ["delete_*"]
+      action: block
+```
+
+A blocked call is **removed** and the model's turn ends with text explaining what was blocked
+(`on_violation: drop`, the default), so the agent can continue, and other allowed calls in the same
+turn still go through. `on_violation: error` refuses the response with HTTP 422
+`tool_call_blocked` instead. Every decision is in `groundwire.tools` and the audit log, and counted
+in `groundwire_tool_calls_total{decision,reason}`.
+
+**Design choices:**
+
+- **Rules run on PII-restored arguments,** so an email-domain rule sees `anita@ourco.com`, not
+  `[EMAIL_1]`.
+- **No argument values in logs, metadata or explanations:** they often hold personal data. Records
+  say which tool, what was decided and why.
+- **Metrics are labelled by decision and reason, not tool name:** tool names come from clients, and
+  unbounded label values overload Prometheus.
+- **The schema check covers the subset tool definitions use in practice** (`type`, `required`,
+  `enum`, ranges, lengths, `additionalProperties: false`); unknown keywords are ignored rather than
+  failed, so an unsupported keyword never breaks a working agent.
+
+**Limits, stated plainly:** the lockdown is only as good as the injection detector, which matches
+known patterns and has not been benchmarked yet; argument limits only cover what you write rules
+for; and a gateway sees one request at a time, so the loop limit counts tool rounds in the history
+the client sends. Measuring this on an agent benchmark (AgentDojo) is the next step.
 
 ---
 
@@ -579,6 +629,7 @@ src/groundwire/
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
+  agents/         tool-call policy engine and JSON Schema argument checks
   evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
                   QQP loader + cachebench/ (semantic-cache benchmark);
                   cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
@@ -608,7 +659,9 @@ scripts/          chaos demo
 - [x] Benchmark quality gates in CI (fast on every push, model-based weekly/on main)
 - [x] Cascade routing with fact-check escalation, simulated on RAGTruth before it was built
 - [x] Tool calling for agents (OpenAI + Anthropic translation, streamed calls assembled, PII-safe)
-- [ ] Tool-call guardrails: per-tool policies, argument limits, injection lockdown (OWASP LLM06)
+- [x] Tool-call guardrails: ordered rules, argument limits, schema checks, injection lockdown,
+      loop limit (OWASP LLM06/LLM10)
+- [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

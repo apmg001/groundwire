@@ -8,6 +8,8 @@ Responsibilities (and nothing else):
   in-flight requests into one provider call,
 * run cascade routes (cheap model first, strong model only when the answer
   fails the fact-check) through :class:`CascadeRunner`,
+* enforce the tool policy on every tool call a model requests, after PII is
+  restored and before the client (the agent) receives it,
 * enforce the end-to-end deadline across retries and failover,
 * run grounding verification when the client asks for it and apply the
   flag/block policy,
@@ -40,13 +42,16 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from groundwire.agents.policy import PolicyResult, ToolPolicy
 from groundwire.cache.service import CacheLookup, CacheStatus, ResponseCache
 from groundwire.cache.singleflight import SingleFlight
+from groundwire.core.config import ToolViolationHandling
 from groundwire.core.errors import (
     GatewayTimeoutError,
     GroundingViolationError,
     GroundwireError,
     InvalidRequestError,
+    ToolCallBlockedError,
 )
 from groundwire.domain.models import (
     AssistantMessage,
@@ -126,6 +131,7 @@ class ChatService:
         safety: SafetyGuard | None = None,
         cache: ResponseCache | None = None,
         cascade: CascadeRunner | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> None:
         """Create the service.
 
@@ -139,6 +145,7 @@ class ChatService:
             cache: Response cache; ``None`` disables caching and coalescing.
             cascade: Cascade runner (built from ``router`` and ``verifier`` if
                 omitted; it only acts on routes configured as cascades).
+            tool_policy: Guardrails for model tool calls; ``None`` disables them.
         """
         self._router = router
         self._verifier = verifier
@@ -147,6 +154,7 @@ class ChatService:
         self._safety = safety
         self._cache = cache
         self._cascade = cascade or CascadeRunner(router, verifier, metrics=metrics)
+        self._tool_policy = tool_policy
         self._flights: SingleFlight[_Answer] = SingleFlight()
 
     # ------------------------------------------------------------------ #
@@ -209,7 +217,13 @@ class ChatService:
             answer = await self._call_provider(route, prepared, lookup, request)
 
         text = self._restore(answer.completion.text, prepared)
-        calls = self._restore_calls(answer.completion.tool_calls, prepared)
+        proposed = self._restore_calls(answer.completion.tool_calls, prepared)
+        calls, policy = self._enforce_tools(proposed, request, prepared)
+        finish_reason = answer.completion.finish_reason
+        if policy is not None and proposed and not calls:
+            # Every call was blocked: answer in text, so the agent loop ends cleanly.
+            text = (text + "\n\n" if text.strip() else "") + policy.explanation()
+            finish_reason = "stop"
         meta: dict[str, Any] = {
             "route": route,
             "provider": answer.provider,
@@ -223,10 +237,12 @@ class ChatService:
             meta["safety"] = safety_meta
         if lookup is not None:
             meta["cache"] = lookup.as_dict()
+        if policy is not None:
+            meta["tools"] = policy.as_dict()
 
         report: GroundingReport | None = None
         grounding = request.groundwire.grounding if request.groundwire else None
-        if grounding is not None and calls and not text.strip():
+        if grounding is not None and proposed and not answer.completion.text.strip():
             # A tool call is a request for action, not a factual claim: nothing
             # to check against documents (tool policies govern calls instead).
             meta["grounding"] = {"verdict": "skipped", "reason": "tool_calls"}
@@ -247,7 +263,7 @@ class ChatService:
             choices=[Choice(message=AssistantMessage(
                                 content=text if text or not calls else None,
                                 tool_calls=calls or None),
-                            finish_reason=answer.completion.finish_reason)],
+                            finish_reason=finish_reason)],
             usage=answer.completion.usage,
             groundwire=meta,
         )
@@ -479,16 +495,27 @@ class ChatService:
         # (a partial call is useless to an agent and cannot be checked).
         assembler = ToolCallAssembler()
         calls: list[ToolCall] = []
+        policy_result: PolicyResult | None = None
+        released = False
         sent_text = False
 
         def release_calls() -> dict[str, Any] | None:
-            nonlocal calls
-            if not assembler or calls:
+            nonlocal calls, policy_result, released
+            if not assembler or released:
                 return None
-            calls = self._restore_calls(assembler.calls(), prepared)
-            return StreamChunk.tool_calls(calls, role=not sent_text).model_copy(update={
-                "id": stream_id, "created": created, "model": request.model,
-            }).model_dump(exclude_none=True)
+            released = True
+            proposed = self._restore_calls(assembler.calls(), prepared)
+            calls, policy_result = self._enforce_tools(proposed, request, prepared)
+            stamp = {"id": stream_id, "created": created, "model": request.model}
+            if calls:
+                return StreamChunk.tool_calls(calls, role=not sent_text).model_copy(
+                    update=stamp).model_dump(exclude_none=True)
+            if policy_result is not None:  # every call was blocked: explain in text
+                prefix = "\n\n" if sent_text else ""
+                return StreamChunk.text(prefix + policy_result.explanation(),
+                                        role=not sent_text).model_copy(
+                    update=stamp).model_dump(exclude_none=True)
+            return None
 
         try:
             async for chunk in chunks:
@@ -519,6 +546,10 @@ class ChatService:
                     ready = release_calls()  # complete calls go out before the finish marker
                     if ready is not None:
                         yield ready
+                    if policy_result is not None and not calls:
+                        for choice in chunk.choices:  # no calls left: the turn ends in text
+                            if choice.finish_reason == "tool_calls":
+                                choice.finish_reason = "stop"
                 if chunk.content() or chunk.usage or finishing:
                     sent_text = sent_text or bool(chunk.content())
                     yield chunk.model_dump(exclude_none=True)
@@ -535,7 +566,7 @@ class ChatService:
                 yield ready
 
             report: GroundingReport | None = None
-            tool_only = bool(calls) and not "".join(parts).strip()
+            tool_only = bool(assembler) and not "".join(parts).strip()
             if grounding is not None and not tool_only:
                 report = await self._check_grounding("".join(parts), grounding,
                                                      _last_user_message(request))
@@ -548,6 +579,9 @@ class ChatService:
             if grounding is not None and tool_only:
                 extra = extra or {"route": route, "provider": provider}
                 extra["grounding"] = {"verdict": "skipped", "reason": "tool_calls"}
+            if policy_result is not None:
+                extra = extra or {"route": route, "provider": provider}
+                extra["tools"] = policy_result.as_dict()
             if extra is not None:
                 yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
                        "model": request.model, "choices": [], "groundwire": extra}
@@ -672,6 +706,40 @@ class ChatService:
             return PreparedRequest(request=request)
         grounding = request.groundwire.grounding if request.groundwire else None
         return self._safety.prepare(request, grounding.context if grounding else None)
+
+    def _enforce_tools(self, calls: list[ToolCall], request: ChatCompletionRequest,
+                       prepared: PreparedRequest) -> tuple[list[ToolCall], PolicyResult | None]:
+        """Apply the tool policy to the calls a model requested.
+
+        Runs on PII-restored calls, so rules see real values (an email-domain
+        rule must see the real address, not ``[EMAIL_1]``).
+
+        Args:
+            calls: Proposed calls.
+            request: The client's request (offered tools, history).
+            prepared: Safety-processed request (injection verdict).
+
+        Returns:
+            ``(allowed_calls, result)``; ``result`` is ``None`` when the policy
+            is off or there were no calls.
+
+        Raises:
+            ToolCallBlockedError: A call was blocked and ``on_violation`` is ``error``.
+        """
+        policy = self._tool_policy
+        if not calls or policy is None or not policy.enabled:
+            return calls, None
+        result = policy.evaluate(calls, request,
+                                 injection_suspected=prepared.injection_action != "none")
+        for decision in result.decisions:
+            self._metrics.tool_calls.labels(
+                decision="allowed" if decision.allowed else "blocked",
+                reason=decision.reason.value if decision.reason else "").inc()
+        if result.blocked and policy.on_violation is ToolViolationHandling.ERROR:
+            raise ToolCallBlockedError(
+                "the model requested a tool call that the tool policy forbids",
+                details={"tools": result.as_dict()})
+        return result.allowed_calls, result
 
     def _restore_calls(self, calls: list[ToolCall], prepared: PreparedRequest) -> list[ToolCall]:
         """Put real PII values back into tool-call arguments.

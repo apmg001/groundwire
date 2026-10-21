@@ -136,6 +136,17 @@ providers:
         name: issue_refund
         arguments: {order_id: 7781, amount: 49.99}
 
+  # Guardrail demo: asks for a refund far above the refund-cap rule (5000).
+  - name: mock-agent-greedy
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund for order 7781 has been issued."
+      latency_s: 0.01
+      tool_call:
+        name: issue_refund
+        arguments: {order_id: 7781, amount: 100000}
+
 routes:
   # Local first; cloud providers only take over if enabled and local fails.
   default: [llama-local, ollama-local, groq, openai, anthropic]
@@ -143,6 +154,7 @@ routes:
   demo: [mock-flaky, mock-stable]
   # Tool-calling demo (no API key needed).
   agent-demo: [mock-agent]
+  agent-demo-risky: [mock-agent-greedy]   # blocked by tool_policy refund-cap
 
 # Cheap-first routing: try the cheap tier, fact-check its answer against the request's
 # grounding documents, escalate to the strong tier only if the check fails.
@@ -155,5 +167,24 @@ cascades:
     escalate_below: 0.5        # with the default lexical scorer: share of supported claims
     on_check_error: escalate   # escalate | serve_cheap
     without_context: strong    # no documents to check against -> strong | cheap
+
+# Guardrails for tool calls made by AI agents (OWASP LLM06 "Excessive Agency").
+# The model only proposes actions; these rules decide, in code, before the agent sees them.
+tool_policy:
+  enabled: true
+  on_violation: drop           # drop: remove the call and explain in text | error: HTTP 422
+  injection_lockdown: true     # suspected prompt injection in the request -> no tool may run
+  max_tool_rounds: 25          # stop runaway agent loops (OWASP LLM10)
+  validate_arguments: true     # arguments must match the tool's own JSON Schema
+  reject_unknown_tools: true   # block tools the request never offered
+  default_action: allow        # set to block for an allowlist
+  rules:                       # first matching rule wins (like a firewall)
+    - name: refund-cap
+      tools: [issue_refund]
+      arguments:
+        amount: {max: 5000}
+    - name: no-deletes
+      tools: ["delete_*", "drop_*"]
+      action: block
 
 default_route: default

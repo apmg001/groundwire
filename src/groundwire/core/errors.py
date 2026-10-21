@@ -275,6 +275,13 @@ class GroundingViolationError(GroundwireError):
     code = "grounding_violation"
 
 
+class ToolCallBlockedError(GroundwireError):
+    """The model requested a tool call that the tool policy forbids (``on_violation: error``)."""
+
+    http_status = 422
+    code = "tool_call_blocked"
+
+
 class PromptInjectionError(GroundwireError):
     """The request looks like a prompt-injection attempt and policy is ``block``."""
 

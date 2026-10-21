@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from groundwire.agents.policy import ToolPolicy
 from groundwire.cache import ResponseCache, build_cache
 from groundwire.core.config import GatewayConfig
 from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
@@ -88,7 +89,8 @@ def build_container(
     response_cache = cache or build_cache(config.cache, metrics=metrics)
     cascade = CascadeRunner(router, grounding, metrics=metrics)
     chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
-                       safety=guard, cache=response_cache, cascade=cascade)
+                       safety=guard, cache=response_cache, cascade=cascade,
+                       tool_policy=ToolPolicy(config.tool_policy))
     return Container(config=config, providers=built_providers, metrics=metrics,
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
                      chat=chat)
