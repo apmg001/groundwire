@@ -154,6 +154,8 @@ routes:
   # Tool-calling demo (no API key needed).
   agent-demo: [mock-agent]
   agent-demo-risky: [mock-agent-greedy]   # blocked by tool_policy refund-cap
+  # A real local model with tool calling: make agent / make agent-risky (needs Ollama running).
+  ollama: [ollama-local]
 
 # Cheap-first routing: try the cheap tier, fact-check its answer against the request's
 # grounding documents, escalate to the strong tier only if the check fails.
