@@ -11,6 +11,12 @@ Usage::
     make run                                   # terminal 1: the gateway
     python scripts/agent_demo.py               # terminal 2: safe refund
     python scripts/agent_demo.py --scenario risky   # a refund the policy blocks
+    python scripts/agent_demo.py --sequential       # one tool call per step
+
+``--sequential`` asks for ``parallel_tool_calls: false`` so the model must see
+one tool's result before choosing the next call (look up the order, *then*
+refund). Not every server honours that flag, so the agent also enforces it:
+if several calls come back anyway, it runs only the first and reports it.
 
 Exit codes: 0 finished, 1 gateway/model error, 2 gateway not reachable.
 """
@@ -145,7 +151,8 @@ def run_tool(name: str, raw_arguments: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
-def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6) -> AgentRun:
+def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6,
+              sequential: bool = False) -> AgentRun:
     """Run the tool loop until the model answers in text.
 
     Args:
@@ -153,6 +160,8 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
         model: Route alias (``model`` field).
         task: The user's request.
         max_steps: Model calls allowed before giving up.
+        sequential: Ask for one tool call per step, and enforce it if the
+            server ignores the request.
 
     Returns:
         The transcript.
@@ -166,8 +175,11 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
                                       "orders before refunding. Be brief."},
         {"role": "user", "content": task}])
     for step in range(1, max_steps + 1):
-        response = client.post("/v1/chat/completions", json={
-            "model": model, "messages": run.messages, "tools": TOOL_SPECS, "temperature": 0})
+        body: dict[str, Any] = {"model": model, "messages": run.messages, "tools": TOOL_SPECS,
+                                "temperature": 0}
+        if sequential:
+            body["parallel_tool_calls"] = False
+        response = client.post("/v1/chat/completions", json=body)
         data = response.json()
         if response.status_code != 200:
             raise RuntimeError(f"gateway error {response.status_code}: {data.get('error')}")
@@ -182,6 +194,11 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
             run.answer = message.get("content") or ""
             run.steps.append(f"[{step}] model answered (via {meta.get('provider')})")
             return run
+        if sequential and len(calls) > 1:
+            names = ", ".join(c["function"]["name"] for c in calls)
+            run.steps.append(f"[{step}] server ignored parallel_tool_calls=false and returned "
+                             f"{len(calls)} calls ({names}); running only the first")
+            calls = calls[:1]  # the model will ask again once it has seen this result
         run.messages.append({"role": "assistant", "content": message.get("content"),
                              "tool_calls": calls})
         for call in calls:
@@ -213,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="route alias (default: 'default', which reaches Ollama)")
     parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="safe")
     parser.add_argument("--timeout", type=float, default=180.0, help="seconds per model call")
+    parser.add_argument("--sequential", action="store_true",
+                        help="one tool call per step (parallel_tool_calls=false)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # keep the transcript readable
@@ -220,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with httpx.Client(base_url=args.url, timeout=args.timeout) as client:
             client.get("/healthz").raise_for_status()
-            run = run_agent(client, args.model, SCENARIOS[args.scenario])
+            run = run_agent(client, args.model, SCENARIOS[args.scenario],
+                            sequential=args.sequential)
     except httpx.ConnectError:
         logger.error("cannot reach the gateway at %s. Start it first: make run", args.url)
         return 2
@@ -228,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("agent failed: %s", exc)
         return 1
 
-    logger.info("TASK: %s\n", SCENARIOS[args.scenario])
+    mode = "sequential" if args.sequential else "parallel allowed"
+    logger.info("TASK: %s  [%s]\n", SCENARIOS[args.scenario], mode)
     for line in run.steps:
         logger.info(line)
     logger.info("\nFINAL ANSWER: %s", run.answer)
