@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -146,6 +147,24 @@ def test_load_parquet(tmp_path: Path) -> None:
     assert [p.is_duplicate for p in pairs] == [bool(r[2]) for r in ROWS]
     with pytest.raises(DatasetError, match="not found"):
         load_qqp(tmp_path / "train.parquet")
+
+
+def test_missing_parquet_says_download_even_without_pyarrow(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "pyarrow", None)  # simulate pyarrow not installed
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+    with pytest.raises(DatasetError, match="make bench-cache-data"):
+        load_qqp(tmp_path / "validation.parquet")
+
+
+def test_existing_parquet_without_pyarrow_says_install(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "validation.parquet"
+    path.write_bytes(b"not really parquet")
+    monkeypatch.setitem(sys.modules, "pyarrow", None)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", None)
+    with pytest.raises(DatasetError, match="needs pyarrow"):
+        load_qqp(path)
 
 
 def test_qqp_path_prefers_parquet(tmp_path: Path) -> None:

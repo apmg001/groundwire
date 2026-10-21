@@ -121,12 +121,14 @@ def _read_parquet(path: Path) -> Iterator[dict[str, Any]]:
     Raises:
         DatasetError: If pyarrow is missing, or the file is missing or unreadable.
     """
+    # Check the file first: "download the data" is the more useful message when
+    # both the data and pyarrow are missing (e.g. a fresh clone or CI).
+    if not path.is_file():
+        raise DatasetError(f"{path} not found. Download it first: make bench-cache-data")
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise DatasetError('reading .parquet needs pyarrow: pip install -e ".[bench]"') from exc
-    if not path.is_file():
-        raise DatasetError(f"{path} not found. Download it first: make bench-cache-data")
     try:
         table = pq.read_table(path, columns=["question1", "question2", "label", "idx"])
     except (OSError, ValueError, KeyError) as exc:
