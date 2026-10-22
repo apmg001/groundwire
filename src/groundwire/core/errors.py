@@ -282,6 +282,13 @@ class ToolCallBlockedError(GroundwireError):
     code = "tool_call_blocked"
 
 
+class AnswerCheckFailedError(GroundwireError):
+    """An agent's answer contradicts its tool results and the policy is ``block``."""
+
+    http_status = 422
+    code = "answer_check_failed"
+
+
 class PromptInjectionError(GroundwireError):
     """The request looks like a prompt-injection attempt and policy is ``block``."""
 

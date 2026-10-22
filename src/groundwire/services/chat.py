@@ -10,6 +10,8 @@ Responsibilities (and nothing else):
   fails the fact-check) through :class:`CascadeRunner`,
 * enforce the tool policy on every tool call a model requests, after PII is
   restored and before the client (the agent) receives it,
+* fact-check an agent's final answer against the tool results in the
+  conversation (numbers and claimed actions), and flag/annotate/block it,
 * enforce the end-to-end deadline across retries and failover,
 * run grounding verification when the client asks for it and apply the
   flag/block policy,
@@ -42,11 +44,13 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from groundwire.agents.answer_check import AnswerChecker, AnswerCheckReport
 from groundwire.agents.policy import PolicyResult, ToolPolicy
 from groundwire.cache.service import CacheLookup, CacheStatus, ResponseCache
 from groundwire.cache.singleflight import SingleFlight
-from groundwire.core.config import ToolViolationHandling
+from groundwire.core.config import AnswerCheckAction, ToolViolationHandling
 from groundwire.core.errors import (
+    AnswerCheckFailedError,
     GatewayTimeoutError,
     GroundingViolationError,
     GroundwireError,
@@ -132,6 +136,7 @@ class ChatService:
         cache: ResponseCache | None = None,
         cascade: CascadeRunner | None = None,
         tool_policy: ToolPolicy | None = None,
+        answer_checker: AnswerChecker | None = None,
     ) -> None:
         """Create the service.
 
@@ -146,6 +151,8 @@ class ChatService:
             cascade: Cascade runner (built from ``router`` and ``verifier`` if
                 omitted; it only acts on routes configured as cascades).
             tool_policy: Guardrails for model tool calls; ``None`` disables them.
+            answer_checker: Fact-check of final answers against tool results;
+                ``None`` disables it.
         """
         self._router = router
         self._verifier = verifier
@@ -155,6 +162,7 @@ class ChatService:
         self._cache = cache
         self._cascade = cascade or CascadeRunner(router, verifier, metrics=metrics)
         self._tool_policy = tool_policy
+        self._answer_checker = answer_checker
         self._flights: SingleFlight[_Answer] = SingleFlight()
 
     # ------------------------------------------------------------------ #
@@ -178,6 +186,8 @@ class ChatService:
             GroundingViolationError: Grounding failed in ``block`` mode.
             GuardrailUnavailableError: Grounding could not run (fail-closed).
             PromptInjectionError: Injection detected and the policy is ``block``.
+            AnswerCheckFailedError: The answer contradicts its tool results and
+                the answer check is in ``block`` mode.
         """
         route = self._router.resolve(request.model)
         started = time.perf_counter()
@@ -240,6 +250,14 @@ class ChatService:
         if policy is not None:
             meta["tools"] = policy.as_dict()
 
+        # Only a *final* answer is checked: when the model asked for tools (even
+        # blocked ones), the text is a preamble or the gateway's own explanation.
+        check: AnswerCheckReport | None = None
+        if not proposed:
+            check = self._check_answer(text, request)
+            if check is not None:
+                meta["answer_check"] = check.as_dict()
+
         report: GroundingReport | None = None
         grounding = request.groundwire.grounding if request.groundwire else None
         if grounding is not None and proposed and not answer.completion.text.strip():
@@ -255,8 +273,14 @@ class ChatService:
                                                  precomputed=reusable)
             meta["grounding"] = report.as_dict()
 
-        if lookup is not None and not lookup.hit and not lookup.coalesced:
+        if (lookup is not None and not lookup.hit and not lookup.coalesced
+                and not (check is not None and check.failed)):
             await self._cache_store(lookup, answer.completion, answer.provider, report)
+
+        if (check is not None and check.failed and text.strip()
+                and self._answer_check_action() is AnswerCheckAction.ANNOTATE):
+            # After grounding, so the warning itself is never fact-checked.
+            text = f"{text}\n\n{check.warning()}"
 
         return ChatCompletionResponse(
             model=request.model,
@@ -339,7 +363,9 @@ class ChatService:
         must be complete before it can be fact-checked. They are produced in
         full, checked, then streamed out; the first token arrives later, but
         streaming clients keep working, and grounding ``block`` mode is
-        supported because nothing is sent before the check.
+        supported because nothing is sent before the check. The same applies to
+        agent answers when the answer check is in ``annotate`` or ``block``
+        mode: the answer must be complete before it can be changed or refused.
 
         Args:
             request: Validated client request with ``stream=True``.
@@ -355,10 +381,12 @@ class ChatService:
             GatewayTimeoutError: No stream started before the deadline.
             AllProvidersFailedError: Every provider failed to start a stream.
             PromptInjectionError: Injection detected and the policy is ``block``.
+            AnswerCheckFailedError: The answer contradicts its tool results
+                (answer check in ``block`` mode; raised before any byte is sent).
         """
         grounding = request.groundwire.grounding if request.groundwire else None
         route = self._router.resolve(request.model)
-        if self._router.cascade_config(route) is not None:
+        if self._router.cascade_config(route) is not None or self._must_buffer(request):
             return await self._stream_buffered(request, route)
         if grounding is not None and grounding.mode is GroundingMode.BLOCK:
             raise InvalidRequestError(
@@ -498,6 +526,11 @@ class ChatService:
         policy_result: PolicyResult | None = None
         released = False
         sent_text = False
+        # Answer check in flag mode runs on the streamed text once it is complete
+        # (other modes never get here: they use the buffered path).
+        check_answer = self._answer_checker is not None and self._answer_checker.applies_to(
+            request)
+        collect_text = grounding is not None or check_answer
 
         def release_calls() -> dict[str, Any] | None:
             nonlocal calls, policy_result, released
@@ -539,7 +572,7 @@ class ChatService:
                         if tail:
                             delta = chunk.choices[0].delta
                             delta.content = (delta.content or "") + tail
-                if grounding is not None:
+                if collect_text:
                     parts.append(chunk.content())
                 finishing = any(c.finish_reason is not None for c in chunk.choices)
                 if finishing:
@@ -582,6 +615,11 @@ class ChatService:
             if policy_result is not None:
                 extra = extra or {"route": route, "provider": provider}
                 extra["tools"] = policy_result.as_dict()
+            if check_answer and not assembler:
+                check = self._check_answer("".join(parts), request)
+                if check is not None:
+                    extra = extra or {"route": route, "provider": provider}
+                    extra["answer_check"] = check.as_dict()
             if extra is not None:
                 yield {"id": stream_id, "object": "chat.completion.chunk", "created": created,
                        "model": request.model, "choices": [], "groundwire": extra}
@@ -740,6 +778,61 @@ class ChatService:
                 "the model requested a tool call that the tool policy forbids",
                 details={"tools": result.as_dict()})
         return result.allowed_calls, result
+
+    def _answer_check_action(self) -> AnswerCheckAction | None:
+        """The configured answer-check action, or ``None`` when the check is off."""
+        checker = self._answer_checker
+        return checker.action if checker is not None and checker.enabled else None
+
+    def _must_buffer(self, request: ChatCompletionRequest) -> bool:
+        """True if this stream's answer may have to be changed or refused.
+
+        ``annotate`` and ``block`` act on the complete answer, so agent
+        conversations (those with tool results) are produced in full first.
+
+        Args:
+            request: Client request.
+
+        Returns:
+            Whether to use the buffered streaming path.
+        """
+        checker = self._answer_checker
+        return (checker is not None and checker.applies_to(request)
+                and checker.action is not AnswerCheckAction.FLAG)
+
+    def _check_answer(self, answer: str,
+                      request: ChatCompletionRequest) -> AnswerCheckReport | None:
+        """Fact-check a final answer against the request's tool results.
+
+        Args:
+            answer: Final answer, PII-restored.
+            request: Client request (unredacted tool results).
+
+        Returns:
+            The report, or ``None`` when the check is off or the conversation
+            has no tool results.
+
+        Raises:
+            AnswerCheckFailedError: Issues found and the action is ``block``.
+        """
+        checker = self._answer_checker
+        if checker is None or not checker.applies_to(request):
+            return None
+        report = checker.check(answer, request)
+        self._metrics.answer_checks.labels(verdict=report.verdict.value).inc()
+        for issue in report.issues:
+            self._metrics.answer_check_issues.labels(kind=issue.kind.value).inc()
+        if report.failed:
+            # Tool names and issue kinds only: never the values (they may be personal data).
+            logger.warning("agent answer contradicts tool results", extra={
+                "issues": [issue.kind.value for issue in report.issues],
+                "tools": sorted({issue.tool for issue in report.issues if issue.tool}),
+                "action": checker.action.value})
+            if checker.action is AnswerCheckAction.BLOCK:
+                raise AnswerCheckFailedError(
+                    "the answer does not match the results of the tools it used",
+                    details={"answer_check": report.as_dict()})
+        return report
 
     def _restore_calls(self, calls: list[ToolCall], prepared: PreparedRequest) -> list[ToolCall]:
         """Put real PII values back into tool-call arguments.

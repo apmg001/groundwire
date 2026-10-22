@@ -12,11 +12,15 @@ Usage::
     python scripts/agent_demo.py               # terminal 2: safe refund
     python scripts/agent_demo.py --scenario risky   # a refund the policy blocks
     python scripts/agent_demo.py --sequential       # one tool call per step
+    python scripts/agent_demo.py --model agent-demo-liar  # no model: a misreported refund
 
 ``--sequential`` asks for ``parallel_tool_calls: false`` so the model must see
 one tool's result before choosing the next call (look up the order, *then*
 refund). Not every server honours that flag, so the agent also enforces it:
 if several calls come back anyway, it runs only the first and reports it.
+
+After the final answer, the transcript shows the gateway's answer check:
+whether what the model *said* matches what the tools *returned*.
 
 Exit codes: 0 finished, 1 gateway/model error, 2 gateway not reachable.
 """
@@ -173,6 +177,31 @@ def final_answer_label(blocked: list[dict[str, Any]], provider: str | None) -> s
     return f"model answered ({via})"
 
 
+def answer_check_lines(check: dict[str, Any] | None, answer: str) -> list[str]:
+    """Describe the gateway's answer check for the transcript.
+
+    Args:
+        check: The ``groundwire.answer_check`` metadata, if the gateway sent it.
+        answer: The final answer (the issue spans point into it).
+
+    Returns:
+        Lines to print (empty when the gateway did not check the answer).
+    """
+    if not check:
+        return []
+    verdict = check.get("verdict")
+    if verdict == "supported":
+        return ["gateway answer check: the answer matches the tool results"]
+    if verdict != "mismatch":
+        return [f"gateway answer check: skipped ({check.get('reason')})"]
+    lines = ["gateway answer check: MISMATCH, the answer does not match the tool results"]
+    for issue in check.get("issues", []):
+        start, end = (issue.get("span") or [0, 0])[:2]
+        claim = answer[start:end] if 0 <= start < end <= len(answer) else "?"
+        lines.append(f"  - '{claim}': {issue.get('detail') or issue.get('kind')}")
+    return lines
+
+
 def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6,
               sequential: bool = False) -> AgentRun:
     """Run the tool loop until the model answers in text.
@@ -216,6 +245,8 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
         if not calls:
             run.answer = message.get("content") or ""
             run.steps.append(f"[{step}] {final_answer_label(blocked, meta.get('provider'))}")
+            run.steps.extend(f"[{step}] {line}"
+                             for line in answer_check_lines(meta.get("answer_check"), run.answer))
             return run
         if sequential and len(calls) > 1:
             names = ", ".join(c["function"]["name"] for c in calls)

@@ -103,6 +103,14 @@ class GatewayMetrics:
         self.tool_calls = Counter(
             "groundwire_tool_calls_total", "Tool calls requested by models, by policy verdict.",
             ["decision", "reason"], registry=r)
+        self.answer_checks = Counter(
+            "groundwire_answer_checks_total",
+            "Agent answers fact-checked against tool results, by verdict.",
+            ["verdict"], registry=r)
+        self.answer_check_issues = Counter(
+            "groundwire_answer_check_issues_total",
+            "Problems found in agent answers, by kind.",
+            ["kind"], registry=r)
         self.coalesced_requests = Counter(
             "groundwire_coalesced_requests_total",
             "Requests answered by an identical in-flight request.", registry=r)

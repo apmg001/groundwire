@@ -103,3 +103,30 @@ def test_run_agent_keeps_the_model_label_for_normal_answers() -> None:
 def test_run_tool_reports_errors_to_the_model() -> None:
     result = json.loads(demo.run_tool("issue_refund", '{"order_id": 7781, "amount": 1000}'))
     assert "exceeds order total" in result["error"]
+
+
+# --------------------------------------------------------------------------- #
+# answer_check_lines
+# --------------------------------------------------------------------------- #
+
+
+def test_answer_check_mismatch_points_at_the_claim() -> None:
+    answer = "I have refunded $49.99 for order 7781."
+    check = {"verdict": "mismatch", "issues": [
+        {"kind": "number_mismatch", "span": [16, 22], "tool": "issue_refund",
+         "detail": "a number in the answer differs from what issue_refund returned"}]}
+    lines = demo.answer_check_lines(check, answer)
+    assert lines[0].startswith("gateway answer check: MISMATCH")
+    assert lines[1] == ("  - '$49.99': a number in the answer differs from what "
+                        "issue_refund returned")
+
+
+def test_answer_check_supported_and_absent() -> None:
+    assert demo.answer_check_lines({"verdict": "supported"}, "ok") == [
+        "gateway answer check: the answer matches the tool results"]
+    assert demo.answer_check_lines(None, "ok") == []
+
+
+def test_answer_check_bad_span_does_not_crash() -> None:
+    check = {"verdict": "mismatch", "issues": [{"kind": "number_mismatch", "span": [5, 99]}]}
+    assert demo.answer_check_lines(check, "short")[1] == "  - '?': number_mismatch"

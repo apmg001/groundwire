@@ -465,6 +465,38 @@ class ToolPolicyConfig(_StrictModel):
     reject_unknown_tools: bool = True
 
 
+class AnswerCheckAction(StrEnum):
+    """What the gateway does when an agent's answer contradicts its tool results."""
+
+    FLAG = "flag"  # deliver unchanged; report issues in ``groundwire.answer_check``
+    ANNOTATE = "annotate"  # append a visible warning to the answer
+    BLOCK = "block"  # refuse the answer (HTTP 422 answer_check_failed)
+
+
+class AnswerCheckConfig(_StrictModel):
+    """Fact-check an agent's final answer against the tool results it was given.
+
+    Catches the agent that runs the right tools and then reports the wrong
+    outcome ("refunded $49.99" when the refund tool returned ``amount: 1``),
+    and claims of actions that never ran or failed. Deterministic: no model
+    call, so it adds microseconds, not seconds.
+
+    Attributes:
+        enabled: Run the check on final answers in conversations with tool results.
+        action: Flag, annotate or block an answer with issues.
+        window_words: How far (in words) a number may be from a tool's words
+            (its name or result field names) to be checked against that tool.
+        min_unbound_value: Numbers not near any tool's words are only reported
+            when they are at least this large, or have a currency sign,
+            percent sign or decimal point (small counts like "2 items" are noise).
+    """
+
+    enabled: bool = True
+    action: AnswerCheckAction = AnswerCheckAction.FLAG
+    window_words: Annotated[int, Field(ge=1, le=50)] = 6
+    min_unbound_value: Annotated[float, Field(ge=0)] = 100.0
+
+
 class CascadeTier(StrEnum):
     """The two tiers of a cascade."""
 
@@ -524,6 +556,7 @@ class GatewayConfig(_StrictModel):
         cascades: Cascade alias -> cheap-first routing policy. Clients select a
             cascade via the ``model`` field, like a route.
         tool_policy: Guardrails for tool calls made by agents.
+        answer_check: Fact-check of agents' final answers against tool results.
     """
 
     providers: Annotated[list[ProviderConfig], Field(min_length=1)]
@@ -537,6 +570,7 @@ class GatewayConfig(_StrictModel):
     cache: CacheConfig = CacheConfig()
     cascades: dict[str, CascadeConfig] = Field(default_factory=dict)
     tool_policy: ToolPolicyConfig = ToolPolicyConfig()
+    answer_check: AnswerCheckConfig = AnswerCheckConfig()
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:

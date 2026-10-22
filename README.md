@@ -527,6 +527,72 @@ the client sends. Measuring this on an agent benchmark (AgentDojo) is the next s
 
 ---
 
+## Answer check: does the agent tell the truth about what its tools did?
+
+Tool guardrails check what an agent **does**. This checks what it **says** afterwards. It catches a
+failure we saw with a real model (Qwen 2.5 3B on Ollama): every tool call was correct, the refund
+tool returned `{"amount": 1, "status": "refunded"}`, and the model told the user *"I have refunded
+$49.99"*.
+
+When the conversation has tool results and the model gives its final text answer, Groundwire checks
+the answer against those results:
+
+| Check | Catches |
+|---|---|
+| **Numbers belong to the right tool** | `refunded $49.99` sits next to *refund*, so it must match `issue_refund`'s data (which holds `1`). `number_mismatch` |
+| **Numbers come from somewhere** | `a $5.00 coupon was applied`: money in no tool result and no user message. `unsupported_number` |
+| **Claimed actions ran** | `your account has been deleted` with no `delete_user` call. `action_not_taken` |
+| **Claimed actions succeeded** | `refunded` when the refund tool returned `{"error": ...}`. `action_failed` |
+
+```json
+"answer_check": {
+  "verdict": "mismatch",
+  "issues": [{"kind": "number_mismatch", "tool": "issue_refund", "span": [16, 22],
+              "detail": "a number in the answer differs from what issue_refund returned"}],
+  "numbers_checked": 2, "actions_checked": 1, "tool_results": 2
+}
+```
+
+```yaml
+answer_check:
+  enabled: true
+  action: flag        # flag: report only | annotate: add a visible warning | block: HTTP 422
+```
+
+Try it with no model or API key: `make run`, then `make agent-liar`. The mock agent refunds $1 and
+then says it refunded $49.99; the transcript shows the gateway pointing at the wrong claim.
+
+**How a number is matched to a tool:** it is bound to the closest word (same sentence, within
+`window_words`) that belongs to a tool: a part of its name (*refund* in `issue_refund`) or a field
+in its data (*total*). So in *"Order total was $49.99; I refunded $1"*, `$49.99` is checked against
+the order lookup and `$1` against the refund, and both pass. Rounding to the answer's precision is
+allowed (`$1,234.57` matches `1234.5678`).
+
+**Design choices:**
+
+- **Deterministic, no model call:** the same answer always gets the same verdict, and it is cheap
+  enough for every agent answer. Median on one CPU core of a cloud dev machine: 0.1 ms for a
+  one-line answer, 1.3 ms for a 400-word answer, 11 ms when a tool returned 4,000 numbers. A
+  model-based judge would add seconds and cost, and can itself be wrong about numbers.
+- **Only final answers are checked:** when the model asks for tools, its text is a preamble.
+- **Precision over recall:** words it cannot bind are left alone; ties pass if any tied tool
+  supports the number; negated or future claims (*could not be refunded*, *will be refunded*) are
+  not claims; read-only tools (`get_*`, `lookup_*`, `search_*`) are not actions.
+- **No values in the report:** issues give the tool, the kind and the character `span`, enough for
+  a UI to highlight the claim without copying personal data into logs.
+- **Streaming:** `flag` streams live and reports in the trailing metadata. `annotate` and `block`
+  must see the whole answer before sending it, so agent turns with tool results are produced in
+  full first (the first token comes later; nothing unchecked is ever sent).
+- **Fails open:** malformed tool data gives `verdict: skipped`, never a failed request.
+
+**Limits, stated plainly:** it checks numbers and completed actions, the claims agents most often
+get wrong and that cost the most. It does not understand free-form claims ("the item is blue"),
+irregular verbs (*sent* for `send_email`) or numbers written as words, and it has been tested on
+hand-written cases, not yet measured on a benchmark. For free-form claims, use grounding with the
+tool results as the context.
+
+---
+
 ## Quality gates: CI fails if accuracy drops
 
 The benchmark numbers above are enforced, not just reported. `config/quality_gates.yaml` defines
@@ -629,7 +695,7 @@ src/groundwire/
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
-  agents/         tool-call policy engine and JSON Schema argument checks
+  agents/         tool-call policy engine, JSON Schema argument checks, answer check
   evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
                   QQP loader + cachebench/ (semantic-cache benchmark);
                   cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
@@ -661,6 +727,7 @@ scripts/          chaos demo
 - [x] Tool calling for agents (OpenAI + Anthropic translation, streamed calls assembled, PII-safe)
 - [x] Tool-call guardrails: ordered rules, argument limits, schema checks, injection lockdown,
       loop limit (OWASP LLM06/LLM10)
+- [x] Answer check: agents' final answers checked against tool results (numbers, claimed actions)
 - [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas

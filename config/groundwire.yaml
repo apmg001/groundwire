@@ -146,6 +146,18 @@ providers:
         name: issue_refund
         arguments: {order_id: 7781, amount: 100000}
 
+  # Answer-check demo: refunds $1, then tells the user it refunded $49.99 (the
+  # exact mistake Qwen 2.5 3B made in a real run). The gateway flags the answer.
+  - name: mock-agent-liar
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "I have refunded $49.99 for order 7781."
+      latency_s: 0.01
+      tool_call:
+        name: issue_refund
+        arguments: {order_id: 7781, amount: 1}
+
 routes:
   # Local first; cloud providers only take over if enabled and local fails.
   default: [llama-local, ollama-local, groq, openai, anthropic]
@@ -154,6 +166,7 @@ routes:
   # Tool-calling demo (no API key needed).
   agent-demo: [mock-agent]
   agent-demo-risky: [mock-agent-greedy]   # blocked by tool_policy refund-cap
+  agent-demo-liar: [mock-agent-liar]       # wrong amount in the answer: answer_check flags it
   # A real local model with tool calling: make agent / make agent-risky (needs Ollama running).
   ollama: [ollama-local]
 
@@ -187,5 +200,13 @@ tool_policy:
     - name: no-deletes
       tools: ["delete_*", "drop_*"]
       action: block
+
+# Fact-check agents' final answers against their tool results (numbers, claimed
+# actions). Catches "I refunded $49.99" when the refund tool returned amount 1.
+answer_check:
+  enabled: true
+  action: flag                 # flag: report in metadata | annotate: add a warning | block: HTTP 422
+  window_words: 6              # how close a number must be to a tool's words to be bound to it
+  min_unbound_value: 100       # plain numbers near no tool are only checked from this size up
 
 default_route: default

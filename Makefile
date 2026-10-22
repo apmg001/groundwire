@@ -1,7 +1,7 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
         bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
         gate gate-full gate-calibrate bench-cascade bench-cascade-token \
-        agent agent-risky agent-seq agent-risky-seq
+        agent agent-risky agent-seq agent-risky-seq agent-liar
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -95,3 +95,6 @@ agent-seq:        ## Safe scenario, one tool call per step (look up first, then 
 
 agent-risky-seq:  ## Risky scenario, one tool call per step
 	python scripts/agent_demo.py --model ollama --scenario risky --sequential
+
+agent-liar:       ## No model needed: an agent that misreports its refund; the answer check flags it
+	python scripts/agent_demo.py --model agent-demo-liar --scenario safe
