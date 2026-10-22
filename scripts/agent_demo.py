@@ -151,6 +151,28 @@ def run_tool(name: str, raw_arguments: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
+def final_answer_label(blocked: list[dict[str, Any]], provider: str | None) -> str:
+    """Say who wrote the final text, so the transcript does not mislead.
+
+    When the gateway drops every requested tool call, the reply the agent
+    receives is the gateway's explanation (after any text the model wrote
+    first), not a normal model answer.
+
+    Args:
+        blocked: Blocked tool decisions from this step's ``groundwire`` metadata.
+        provider: Provider that served the model call, if reported.
+
+    Returns:
+        A one-line description for the transcript.
+    """
+    via = f"via {provider or 'unknown provider'}"
+    if blocked:
+        noun = "call" if len(blocked) == 1 else "calls"
+        return (f"gateway blocked the tool {noun} and explained why "
+                f"(model {via}; no action was taken)")
+    return f"model answered ({via})"
+
+
 def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6,
               sequential: bool = False) -> AgentRun:
     """Run the tool loop until the model answers in text.
@@ -185,14 +207,15 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
             raise RuntimeError(f"gateway error {response.status_code}: {data.get('error')}")
         message = data["choices"][0]["message"]
         meta = data.get("groundwire", {})
-        for decision in meta.get("tools", {}).get("decisions", []):
-            if decision["decision"] == "blocked":
-                run.steps.append(f"[{step}] gateway BLOCKED {decision['tool']}: "
-                                 f"{decision.get('detail') or decision.get('reason')}")
+        blocked = [d for d in meta.get("tools", {}).get("decisions", [])
+                   if d.get("decision") == "blocked"]
+        for decision in blocked:
+            run.steps.append(f"[{step}] gateway BLOCKED {decision.get('tool')}: "
+                             f"{decision.get('detail') or decision.get('reason')}")
         calls = message.get("tool_calls") or []
         if not calls:
             run.answer = message.get("content") or ""
-            run.steps.append(f"[{step}] model answered (via {meta.get('provider')})")
+            run.steps.append(f"[{step}] {final_answer_label(blocked, meta.get('provider'))}")
             return run
         if sequential and len(calls) > 1:
             names = ", ".join(c["function"]["name"] for c in calls)
