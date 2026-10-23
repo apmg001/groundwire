@@ -672,7 +672,8 @@ unset they refuse every request (fail closed), and held calls simply stay held.
 `ToolGate` composes the pure policy with the service, so the chat service makes one call and
 never knows about approvals.
 
-**Limits, stated plainly:** the in-memory store is single-replica and loses pending requests
+**Limits, stated plainly:** the in-memory store is single-process (startup refuses several
+workers; see [Workers and replicas](#workers-and-replicas)) and loses pending requests
 on restart (safe: nothing runs unapproved, and agents ask again). A Redis or Postgres adapter
 only needs to implement the store port. Release depends on the model proposing the same call
 again, which deterministic agents do; a model that changes the arguments needs a new approval
@@ -736,6 +737,28 @@ specific behaviours (wrong invoice numbers) are protected by unit tests.
 
 Every response carries `X-Request-ID` (your own value is reused if you send
 one) and `X-Groundwire-Provider`. All log lines for a request share its ID.
+
+### Workers and replicas
+
+Some state lives inside the process: the in-memory approval store, the in-memory cache,
+circuit breakers and metrics. With several workers, each has its own copy and requests land
+on any of them. Groundwire checks this at startup (`GROUNDWIRE_WORKERS` and uvicorn's
+`WEB_CONCURRENCY`):
+
+| Component | With several workers | Startup |
+|---|---|---|
+| Approvals, in-memory store, with approval rules | **Incorrect**: a call approved on one worker is unknown to the others | **Refused**, with a message saying what to change |
+| Response cache, in memory | Correct, lower hit rate (one cache per worker) | Warning |
+| Circuit breakers, metrics | Correct, tracked per worker | Warning |
+
+This was a real bug, found in a code audit and reproduced before the fix: with 4 workers
+and the agent and reviewer on separate connections, **19 of 20 approval flows failed**
+(14 approvals hit a worker that had never seen the request; 5 were approved but the retry
+stayed pending). The demo had hidden it because one keep-alive connection stays on one worker.
+
+What the check cannot see: an explicit `uvicorn --workers N` flag (use `GROUNDWIRE_WORKERS`
+or the `groundwire` command instead) and separate replicas (containers). The same limits
+apply to replicas: with approval rules and the in-memory store, run exactly one.
 
 ---
 

@@ -223,8 +223,9 @@ tool_policy:
 # Human approval for tool calls held by a require_approval rule. An approval is
 # permission for one exact call (same tool, arguments and `user`), used once.
 # Reviewers use /v1/approvals with the token in the env var below (the reviewer
-# API is disabled while it is unset). In-memory store: single replica, and
-# pending requests are lost on restart (agents simply ask again).
+# API is disabled while it is unset). In-memory store: ONE process and one
+# replica (startup refuses GROUNDWIRE_WORKERS>1 / WEB_CONCURRENCY>1 while approval
+# rules exist); pending requests are lost on restart (agents simply ask again).
 approvals:
   enabled: true
   store: memory

@@ -14,6 +14,8 @@ Run locally::
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
@@ -27,6 +29,7 @@ from groundwire.api.middleware import BodySizeLimitMiddleware, RequestContextMid
 from groundwire.api.routes import router
 from groundwire.container import Container, build_container
 from groundwire.core.config import GatewayConfig, Settings, load_gateway_config
+from groundwire.core.deployment import check_deployment, effective_workers
 from groundwire.core.errors import ConfigurationError
 from groundwire.core.logging import configure_logging
 
@@ -57,6 +60,10 @@ def create_app(
 
     def default_factory() -> Container:
         gateway_config = config or load_gateway_config(settings.config_path)
+        # Runs in every worker: also catches `uvicorn --workers N` / WEB_CONCURRENCY,
+        # which bypass the `groundwire` entrypoint's own check.
+        check_deployment(gateway_config,
+                         workers=effective_workers(settings.workers, os.environ))
         return build_container(gateway_config)
 
     factory = container_factory or default_factory
@@ -101,9 +108,22 @@ def app_factory() -> FastAPI:
 
 
 def run() -> None:
-    """Console-script entrypoint (``groundwire``)."""
+    """Console-script entrypoint (``groundwire``).
+
+    Validates the config for the configured worker count *before* spawning
+    workers, so a bad deployment fails once, clearly, instead of in N workers.
+
+    Raises:
+        SystemExit: With status 2 when the configuration is invalid.
+    """
     settings = Settings()
     configure_logging(settings.log_level, json_output=settings.log_json)
+    try:
+        check_deployment(load_gateway_config(settings.config_path),
+                         workers=effective_workers(settings.workers, os.environ))
+    except ConfigurationError as exc:
+        logger.critical("startup aborted: configuration error", extra={"error": exc.message})
+        sys.exit(2)
     uvicorn.run(
         "groundwire.main:app_factory",
         factory=True,
