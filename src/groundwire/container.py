@@ -24,6 +24,7 @@ from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.providers.base import Provider
 from groundwire.providers.factory import build_providers, close_providers
+from groundwire.resilience.overload import AdmissionController
 from groundwire.routing.cascade import CascadeRunner
 from groundwire.routing.router import Router
 from groundwire.safety.guard import SafetyGuard
@@ -49,6 +50,7 @@ class Container:
         chat: Chat completion service.
         approvals: Human-approval service (``None`` when disabled).
         reviewer_token: Token for the reviewer API (``None``: reviewer API off).
+        admission: Load-shedding controller (``None``: never shed).
     """
 
     config: GatewayConfig
@@ -61,9 +63,17 @@ class Container:
     chat: ChatService
     approvals: ApprovalService | None = None
     reviewer_token: SecretStr | None = None
+    admission: AdmissionController | None = None
+
+    def start(self) -> None:
+        """Start background tasks (the event-loop lag probe). Needs a running loop."""
+        if self.admission is not None:
+            self.admission.start()
 
     async def aclose(self) -> None:
-        """Release provider connection pools and the approval store."""
+        """Stop background tasks; release provider connection pools and the approval store."""
+        if self.admission is not None:
+            await self.admission.aclose()
         await close_providers(self.providers)
         if self.approvals is not None:
             await self.approvals.aclose()
@@ -111,7 +121,8 @@ def build_container(
     return Container(config=config, providers=built_providers, metrics=metrics,
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
                      chat=chat, approvals=approvals,
-                     reviewer_token=_reviewer_token(config.approvals))
+                     reviewer_token=_reviewer_token(config.approvals),
+                     admission=AdmissionController(config.admission, metrics=metrics))
 
 
 def _reviewer_token(config: ApprovalConfig) -> SecretStr | None:

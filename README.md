@@ -8,6 +8,8 @@ OpenAI SDK at it by changing one URL, and every call gets:
 - **Failover across providers**: local llama.cpp first, cloud only if needed.
 - **Retries with jittered backoff** and **per-provider circuit breakers**.
 - **End-to-end deadlines**, so a slow upstream can't hang your app.
+- **Load shedding**: past capacity, excess requests get a fast 503 instead of a
+  20-second queue (load-tested: p99 at 3x capacity went from 19 s to 1.2 s).
 - **Grounding verification**: checks the answer against the context you supplied
   and flags or blocks unsupported claims (invented amounts, dates, IDs).
 - **Prompt-injection screening and PII redaction** before any model sees the request.
@@ -129,12 +131,14 @@ the answer is returned with the report attached.
 
 | Failure | Behaviour |
 |---|---|
-| Timeout, connection error, 5xx, 529, 429 | Retried on the same provider with full-jitter backoff (honours `Retry-After`, capped), then fail over |
+| Connection error, 5xx, 529, 429 | Retried on the same provider with full-jitter backoff (honours `Retry-After`, capped), then fail over |
+| Timeout | Fail over at once: a provider that just used its whole timeout will likely do it again (`retry.retry_on_timeout: true` restores retry-in-place). Halved the worst case in the chaos load test, 20.4 s to 10.4 s |
 | 401 / 403 | No retry (won't fix itself); fail over; counts against the breaker |
 | 400 / 404 / 422 from upstream | Surfaced to the client as 400; **no** failover (the request itself is bad) |
 | Provider keeps failing | Circuit opens after N consecutive failures; calls skip it instantly (no timeout cost) until a half-open probe succeeds |
 | Every provider down | HTTP 503 with a record of each attempt |
 | Too slow overall | HTTP 504 when `request_timeout_s` expires, across all retries and failover |
+| Gateway overloaded (CPU) | New chat requests over an adaptive concurrency limit get HTTP 503 + `Retry-After` in milliseconds; admitted requests stay fast. Health, metrics and reviewer API are never shed ([load tests](#load-and-stress-tests)) |
 | Client disconnects | Upstream call cancelled; breaker probe slot released without a verdict |
 | Grounding scorer crashes | `fail_open` → answer marked `unverified`; `fail_closed` → 503 |
 
@@ -732,7 +736,7 @@ specific behaviours (wrong invoice numbers) are protected by unit tests.
 |---|---|
 | `GET /healthz` | Liveness: process is up. Never touches providers. |
 | `GET /readyz` | Readiness: 503 if any route has every circuit open. |
-| `GET /metrics` | Prometheus: requests, latency, attempts, failovers, circuit state, tokens, grounding verdicts, injection checks, PII redactions, cache hits/misses, tokens saved, coalesced requests. |
+| `GET /metrics` | Prometheus: requests, latency, attempts, failovers, circuit state, tokens, grounding verdicts, injection checks, PII redactions, cache hits/misses, tokens saved, coalesced requests, event-loop lag, requests in flight, concurrency limit, requests shed. |
 | `GET /v1/models` | Route aliases and their provider chains. |
 
 Every response carries `X-Request-ID` (your own value is reused if you send
@@ -795,6 +799,106 @@ some failures, the breaker opens and routes around the rest.
 
 ---
 
+## Load and stress tests
+
+Can the gateway take real traffic, and what happens past its limit? Five Locust
+profiles run against the full pipeline (PII redaction, injection screening,
+cache, grounding, tool policy, answer check all on) with two **fake model
+servers** in front of it. The fake model answers in exactly 300 ms, so any time
+above that is the gateway's own cost, and the fake servers can be broken
+mid-test.
+
+```bash
+make install-load
+make loadtest-load      # also: loadtest-stress, loadtest-spike, loadtest-chaos, loadtest-soak
+```
+
+Each run starts its own fake models and gateway, then writes
+`results/loadtest/<time>-<profile>/report.md` with pass/fail checks, per-stage
+tables and the gateway's memory and CPU.
+
+**Machine:** a 2-CPU cloud sandbox, with Locust and both fake models on the
+same 2 CPUs. One gateway worker (one core). Absolute throughput is a
+lower bound; a laptop or server with more cores, and more workers, does more.
+
+### Results
+
+| Test | What it does | Result |
+|---|---|---|
+| **Load** | 100 users, 60 s, plus the same traffic sent straight to the fake model | 4,497 requests, **0 errors**. Gateway overhead **+12.8 ms** per chat request (mean 314.9 vs 302.1 ms direct), +10.9 ms agent tool call, +11.6 ms stream |
+| **Stress** | 25 → 600 users in 3 min | **0 errors**. Capacity about **130-140 req/s** on one core. At 600 users (3x capacity) served p99 **990 ms**; the excess (388 req/s) gets 503 in ~7 ms |
+| **Spike** | 20 → 300 → 20 users in one second | **0 errors**, served p99 960 ms during the spike, back to normal **10 s** after it |
+| **Chaos** | 100 users; primary model returns 503 for 30 s, recovers, then hangs for 30 s | 8,236 requests, **0 errors**: 4,096 failed over to the backup. Slowest request 10.4 s (one provider timeout) |
+| **Soak** | 100 users, 10 minutes | 44,779 requests, **0 errors**, p99 340 ms. Memory flat: +0.3% over the second half |
+
+### What the tests found and what changed
+
+**1. Past capacity, latency grew without limit.** The first stress run had no
+errors at all, which looked fine until the latency: at 600 users the median
+was 4.6 s and p99 **19 s**. One worker saturates one core at roughly 100-140
+req/s here; past that, requests just queue inside the event loop. A profile
+(py-spy) showed no single hot spot: the CPU is spread over the web framework,
+JSON, pydantic and httpx, so the fix is not "optimise a function" but **stop
+accepting more work than the core can do.**
+
+Load shedding, in four attempts:
+
+| Attempt | 600 users: p99 | Why it was replaced |
+|---|---|---|
+| None | 19,000 ms (p50 4,600) | latency unbounded |
+| Shed with probability rising with event-loop lag, 200 ms target | ≥ 19,000 ms* | lag is per loop turn; a request waits dozens of turns, so 200 ms of lag already means seconds |
+| Same, 20 ms target | ≥ 7,200 ms* (p95 ≥ 4.3 s at 400 users) | lag is a *late* signal: a burst is admitted while lag is low, then all its replies need the CPU at once |
+| Adaptive concurrency limit (AIMD) driven by lag, 20 ms target | 2,600 ms (p50 740), 102 req/s served | good, but the loop is held *at* the target |
+| **Same, 10 ms target** | **990 ms (p50 400), 132 req/s served** | kept |
+
+\* These two runs were measured before the harness reported refusals separately,
+so their percentiles include the fast 503s; served latency was at least this high.
+
+The kept design (`resilience/overload.py`) works like TCP congestion control:
+when lag is over 10 ms the limit on requests in flight drops 10% per probe
+tick, when lag is under 5 ms and the limit is in use it grows 5%, and requests
+over the limit get **503 + `Retry-After`** before their body is even read. The
+10 ms target comes from measurement:
+
+| Users | Event-loop lag p50 / p90 / max | Latency |
+|---|---|---|
+| 100 | 0.6 / 3.3 / 5.3 ms | flat (p50 310 ms) |
+| 150 | 1.8 / 9.0 / 13.2 ms | flat |
+| 200 | 17.6 / 38.2 / 60.8 ms | p50 doubles to 730 ms |
+
+A 20 ms target served 102 req/s at p99 2.6 s; 10 ms served 129-132 req/s at
+p99 1.0-1.2 s (two runs), because less CPU is wasted on queued work. At 100 users nothing is shed.
+Health checks, metrics and the reviewer API are never shed (a reviewer must be
+able to approve a held call precisely when the system is busy).
+
+**2. A hung provider cost two timeouts.** In the chaos test the slowest
+requests took **20.4 s**: the retry policy retried the *same* hung provider
+(10 s timeout x 2) before failing over. A provider that just used its whole
+timeout will likely do it again, so timeouts now fail over at once
+(`retry.retry_on_timeout`, default off). Slowest request: **10.4 s**, and
+throughput during chaos rose from 62 to 68.5 req/s. What remains: requests
+that reach the primary in the first 10 s after it hangs still wait one
+timeout, because the breaker cannot know a call is slow until it times out.
+A separate time-to-first-token timeout or hedged requests would fix that
+(roadmap).
+
+**3. The memory check measured the wrong thing.** The soak's first memory
+check (growth after warm-up, bound 10%) read 9.85%: almost a failure. The
+curve showed why: memory rose until ~300 s, when the response cache reached
+its 10,000-entry limit, then stayed flat (84.6 → 84.8 MB). Bounded caches
+filling up is by design; a leak keeps growing. The check now measures growth
+over the **second half** of the run with a stricter bound (5%), and has a test
+that tells a filling cache from a leak. This check was changed after seeing
+the data; the reason is above.
+
+How the numbers are read: stream latency is time to first byte (what a
+streaming user waits for); "overhead" uses means, because Locust rounds
+percentiles above 100 ms to 10 ms; refusals are reported as their own row,
+`shed (503)`, and excluded from latency, so they cannot make the percentiles
+look better.
+
+---
+
 ## Project layout
 
 ```
@@ -802,7 +906,7 @@ src/groundwire/
   api/            routes, ASGI middleware (request ID, body limit), error mapping
   services/       ChatService: safety, cache, deadline, grounding policy, metrics
   routing/        Router (fallback chains, failover, streaming handoff), CascadeRunner
-  resilience/     RetryPolicy, CircuitBreaker
+  resilience/     RetryPolicy, CircuitBreaker, admission control (lag probe, adaptive limit)
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
@@ -819,7 +923,8 @@ src/groundwire/
   main.py         app factory and entrypoint
 tests/            unit + integration (no network needed)
 config/           gateway YAML (local and Docker variants)
-scripts/          chaos demo
+scripts/          chaos demo, agent demo, reviewer CLI
+loadtest/         fake model server, Locust traffic, profiles, runner + report
 ```
 
 ## Roadmap
@@ -843,6 +948,8 @@ scripts/          chaos demo
 - [x] Human approval for risky tool calls (exact-call, single-use, scoped, audited)
 - [ ] Redis/Postgres approval store and per-reviewer identity
 - [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
+- [x] Load, stress, spike, chaos and soak tests; adaptive load shedding; fail over on timeout
+- [ ] Time-to-first-token timeout or hedged requests (a hung provider still costs one timeout)
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

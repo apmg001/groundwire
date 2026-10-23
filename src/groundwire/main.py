@@ -25,13 +25,18 @@ from fastapi import FastAPI
 from groundwire import __version__
 from groundwire.api.approvals import router as approvals_router
 from groundwire.api.errors import register_exception_handlers
-from groundwire.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from groundwire.api.middleware import (
+    AdmissionMiddleware,
+    BodySizeLimitMiddleware,
+    RequestContextMiddleware,
+)
 from groundwire.api.routes import router
 from groundwire.container import Container, build_container
 from groundwire.core.config import GatewayConfig, Settings, load_gateway_config
 from groundwire.core.deployment import check_deployment, effective_workers
 from groundwire.core.errors import ConfigurationError
 from groundwire.core.logging import configure_logging
+from groundwire.resilience.overload import AdmissionController
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,7 @@ def create_app(
             logger.critical("startup aborted: configuration error", extra={"error": exc.message})
             raise
         app.state.container = container
+        container.start()
         logger.info("groundwire started", extra={"version": __version__,
                                                  "routes": list(container.router.routes)})
         try:
@@ -89,11 +95,19 @@ def create_app(
     app.include_router(router)
     app.include_router(approvals_router)
     register_exception_handlers(app)
-    # Order: outermost first. Request context wraps everything so even 413s
-    # get a request ID and an access-log line.
+    # Added innermost first. Request context wraps everything so even 413s and
+    # 503s get a request ID and an access-log line; admission runs before the
+    # body is read, so a refused request costs almost nothing.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_BODY_BYTES)
+    app.add_middleware(AdmissionMiddleware, controller=lambda: _admission(app))
     app.add_middleware(RequestContextMiddleware)
     return app
+
+
+def _admission(app: FastAPI) -> AdmissionController | None:
+    """The running container's admission controller (``None`` before startup)."""
+    container = getattr(app.state, "container", None)
+    return container.admission if container is not None else None
 
 
 def app_factory() -> FastAPI:

@@ -11,6 +11,7 @@ from groundwire.core.errors import (
     ProviderBadRequestError,
     ProviderRateLimitError,
     ProviderServerError,
+    ProviderTimeoutError,
 )
 from groundwire.resilience.circuit_breaker import CircuitBreaker, CircuitState
 from groundwire.resilience.retry import RetryPolicy
@@ -60,6 +61,23 @@ async def test_retry_gives_up_after_max_attempts() -> None:
     with pytest.raises(ProviderServerError):
         await _policy(max_attempts=3).run(op, provider="p")
     assert calls == 3
+
+
+@pytest.mark.parametrize(("retry_on_timeout", "expected_calls"), [(False, 1), (True, 3)])
+async def test_timeouts_are_only_retried_in_place_when_enabled(
+        retry_on_timeout: bool, expected_calls: int) -> None:
+    calls = 0
+
+    async def op() -> str:
+        nonlocal calls
+        calls += 1
+        raise ProviderTimeoutError("slow", provider="p")
+
+    policy = RetryPolicy(RetryConfig(max_attempts=3, retry_on_timeout=retry_on_timeout),
+                         sleep=_Sleeps(), rng=random.Random(0))
+    with pytest.raises(ProviderTimeoutError):
+        await policy.run(op, provider="p")
+    assert calls == expected_calls
 
 
 async def test_non_retryable_error_is_not_retried() -> None:

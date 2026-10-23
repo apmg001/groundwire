@@ -263,6 +263,30 @@ class GatewayTimeoutError(GroundwireError):
     code = "gateway_timeout"
 
 
+class OverloadedError(GroundwireError):
+    """The gateway refused a new request because it is overloaded (load shedding).
+
+    Attributes:
+        retry_after_s: Seconds the client should wait before retrying
+            (sent as the ``Retry-After`` header).
+    """
+
+    http_status = 503
+    code = "server_overloaded"
+
+    def __init__(self, message: str, *, retry_after_s: int,
+                 details: dict[str, Any] | None = None) -> None:
+        """Create the error.
+
+        Args:
+            message: Human-readable description.
+            retry_after_s: Suggested wait before retrying.
+            details: Optional structured context.
+        """
+        super().__init__(message, details=details)
+        self.retry_after_s = retry_after_s
+
+
 # --------------------------------------------------------------------------- #
 # Guardrail errors
 # --------------------------------------------------------------------------- #

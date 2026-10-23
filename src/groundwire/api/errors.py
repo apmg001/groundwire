@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from groundwire.core.errors import GroundwireError, InvalidRequestError
+from groundwire.core.errors import GroundwireError, InvalidRequestError, OverloadedError
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,9 @@ async def _groundwire_error(_: Request, exc: Exception) -> JSONResponse:
     level = logging.ERROR if exc.http_status >= 500 else logging.INFO
     logger.log(level, "request failed", extra={"error_code": exc.code,
                                                 "status": exc.http_status})
-    return JSONResponse(status_code=exc.http_status, content=exc.to_payload())
+    headers = ({"Retry-After": str(exc.retry_after_s)} if isinstance(exc, OverloadedError)
+               else None)
+    return JSONResponse(status_code=exc.http_status, content=exc.to_payload(), headers=headers)
 
 
 async def _validation_error(_: Request, exc: Exception) -> JSONResponse:

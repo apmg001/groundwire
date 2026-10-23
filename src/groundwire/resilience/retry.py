@@ -5,7 +5,10 @@ the same moment. Retrying them all after exactly 200 ms just recreates the
 spike. Randomising each delay over ``[0, min(cap, base * 2**n)]`` spreads the
 retries out (see the AWS Architecture Blog, "Exponential Backoff and Jitter").
 
-Only errors marked ``retryable`` are retried. A ``Retry-After`` hint from the
+Only errors marked ``retryable`` are retried, and timeouts only when
+``retry_on_timeout`` is set: a provider that just used its whole timeout is
+likely to again, so by default the router fails over at once instead of
+making the client wait a second full timeout. A ``Retry-After`` hint from the
 provider is honoured (capped at ``max_delay_s`` so one upstream cannot stall
 the gateway).
 """
@@ -19,7 +22,7 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from groundwire.core.config import RetryConfig
-from groundwire.core.errors import ProviderError
+from groundwire.core.errors import ProviderError, ProviderTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,19 @@ class RetryPolicy:
         ceiling = min(cap, self.config.base_delay_s * (2 ** (attempt - 1)))
         return self._rng.uniform(0, ceiling)
 
+    def _should_retry(self, exc: ProviderError) -> bool:
+        """Whether to retry ``exc`` on the same provider (failover is the router's job).
+
+        Args:
+            exc: The error from the attempt that just failed.
+
+        Returns:
+            True for retryable errors, except timeouts unless ``retry_on_timeout``.
+        """
+        if isinstance(exc, ProviderTimeoutError) and not self.config.retry_on_timeout:
+            return False
+        return exc.retryable
+
     async def run(self, operation: Callable[[], Awaitable[T]], *, provider: str) -> T:
         """Run ``operation``, retrying retryable provider errors.
 
@@ -88,7 +104,7 @@ class RetryPolicy:
             try:
                 return await operation()
             except ProviderError as exc:
-                if not exc.retryable or attempt >= self.config.max_attempts:
+                if not self._should_retry(exc) or attempt >= self.config.max_attempts:
                     raise
                 delay = self.backoff_delay(attempt, exc.retry_after_s)
                 logger.warning(

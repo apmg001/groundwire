@@ -122,6 +122,20 @@ class GatewayMetrics:
         self.coalesced_requests = Counter(
             "groundwire_coalesced_requests_total",
             "Requests answered by an identical in-flight request.", registry=r)
+        self.load_shed = Counter(
+            "groundwire_load_shed_total",
+            "New requests refused with 503 because the gateway was overloaded, by reason.",
+            ["reason"], registry=r)
+        self.event_loop_lag = Gauge(
+            "groundwire_event_loop_lag_seconds",
+            "Smoothed event-loop lag (how long ready work waits to run).", registry=r)
+        self.in_flight = Gauge(
+            "groundwire_requests_in_flight",
+            "Chat requests admitted and not yet finished (streams included).", registry=r)
+        self.concurrency_limit = Gauge(
+            "groundwire_concurrency_limit",
+            "Adaptive limit on chat requests in flight (lowered when the event loop lags).",
+            registry=r)
 
     # ------------------------------------------------------------------ #
     # Recording helpers

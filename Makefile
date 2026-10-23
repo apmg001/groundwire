@@ -2,7 +2,8 @@
         bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
         gate gate-full gate-calibrate bench-cascade bench-cascade-token \
         agent agent-risky agent-seq agent-risky-seq agent-liar \
-        agent-approval agent-approval-manual approvals approve reject
+        agent-approval agent-approval-manual approvals approve reject \
+        install-load loadtest-load loadtest-stress loadtest-spike loadtest-chaos loadtest-soak
 
 # Reviewer token for the approval API (make run and the approval targets share it).
 # Development default only: set your own secret in any shared or deployed setup.
@@ -119,3 +120,27 @@ approve:          ## Approve a held call: make approve ID=apr_... [NOTE="..."]
 
 reject:           ## Reject a held call: make reject ID=apr_... [NOTE="..."]
 	python scripts/approvals.py reject $(ID) $(if $(NOTE),--note "$(NOTE)")
+
+# --------------------------------------------------------------------------- #
+# Load tests: each starts two fake model servers and a gateway, runs Locust,
+# and writes results/loadtest/<time>-<profile>/report.md. Stop anything on
+# ports 8020, 9101 and 9102 first.
+# --------------------------------------------------------------------------- #
+
+install-load:     ## Install Locust and psutil for the load tests
+	pip install -e ".[load]"
+
+loadtest-load:    ## 100 users for 60 s, plus a baseline straight to the fake model (overhead)
+	python -m loadtest.run load --users 100 --duration 60 --baseline
+
+loadtest-stress:  ## 25 -> 600 users in 3 minutes: where is the limit, and does shedding hold it?
+	python -m loadtest.run stress
+
+loadtest-spike:   ## 20 -> 300 -> 20 users: survive the burst and recover
+	python -m loadtest.run spike
+
+loadtest-chaos:   ## 100 users while the primary model fails, then hangs: failover under load
+	python -m loadtest.run chaos --users 100 --duration 120
+
+loadtest-soak:    ## 100 users for 10 minutes: memory must stay flat
+	python -m loadtest.run soak --users 100 --duration 600

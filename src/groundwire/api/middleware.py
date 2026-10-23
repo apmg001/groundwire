@@ -1,4 +1,4 @@
-"""ASGI middleware: request IDs, access logging and body-size limits.
+"""ASGI middleware: request IDs, access logging, body-size limits and load shedding.
 
 Written as plain ASGI middleware rather than Starlette's ``BaseHTTPMiddleware``
 because the latter buffers/wraps streaming responses and interacts badly with
@@ -10,11 +10,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from groundwire.core.context import new_request_id, set_request_id
+from groundwire.core.errors import GroundwireError, OverloadedError
+from groundwire.resilience.overload import AdmissionController
 
 logger = logging.getLogger("groundwire.access")
 
@@ -146,4 +149,86 @@ async def _send_413(send: Send, max_bytes: int) -> None:
     await send({"type": "http.response.start", "status": 413,
                 "headers": [(b"content-type", b"application/json"),
                             (b"content-length", str(len(payload)).encode())]})
+    await send({"type": "http.response.body", "body": payload})
+
+
+# --------------------------------------------------------------------------- #
+# Load shedding
+# --------------------------------------------------------------------------- #
+
+SHED_PATHS = frozenset({"/v1/chat/completions"})
+SHED_LOG_INTERVAL_S = 10.0
+
+
+class AdmissionMiddleware:
+    """Refuse new chat requests with HTTP 503 when the gateway is overloaded.
+
+    Only ``POST`` to :data:`SHED_PATHS` is subject to admission control, so
+    health probes, metrics and the reviewer API keep working under overload
+    (a reviewer must be able to approve a held call precisely when the system
+    is busy). The admitted request counts as in flight until its response,
+    including a whole SSE stream, has been sent.
+
+    A refusal is deliberately cheap: no body is read, no handler runs, and
+    at most one warning is logged every :data:`SHED_LOG_INTERVAL_S` seconds
+    (refusals are counted in ``groundwire_load_shed_total``).
+    """
+
+    def __init__(self, app: ASGIApp, *,
+                 controller: Callable[[], AdmissionController | None]) -> None:
+        """Wrap ``app``.
+
+        Args:
+            app: Downstream ASGI app.
+            controller: Returns the admission controller, or ``None`` before
+                startup has built it (requests then pass through).
+        """
+        self.app = app
+        self._controller = controller
+        self._last_log = 0.0
+        self._shed_since_log = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Handle one ASGI connection.
+
+        Args:
+            scope: ASGI scope.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+        """
+        controller = self._controller() if scope["type"] == "http" else None
+        if (controller is None or scope.get("method") != "POST"
+                or scope.get("path") not in SHED_PATHS):
+            await self.app(scope, receive, send)
+            return
+        try:
+            admission = controller.admit()
+            admission.__enter__()
+        except OverloadedError as exc:
+            self._note_shed(exc)
+            await _send_error(send, exc,
+                              extra_headers=[(b"retry-after", str(exc.retry_after_s).encode())])
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            admission.__exit__(None, None, None)
+
+    def _note_shed(self, exc: OverloadedError) -> None:
+        self._shed_since_log += 1
+        now = time.monotonic()
+        if now - self._last_log >= SHED_LOG_INTERVAL_S:
+            logger.warning("shedding load", extra={"refused": self._shed_since_log,
+                                                    "reason": exc.details.get("reason"),
+                                                    "detail": exc.message})
+            self._last_log, self._shed_since_log = now, 0
+
+
+async def _send_error(send: Send, exc: GroundwireError, *,
+                      extra_headers: list[tuple[bytes, bytes]] | None = None) -> None:
+    payload = json.dumps(exc.to_payload()).encode()
+    await send({"type": "http.response.start", "status": exc.http_status,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(payload)).encode()),
+                            *(extra_headers or [])]})
     await send({"type": "http.response.body", "body": payload})

@@ -25,6 +25,8 @@ dependencies = [
 nli = ["transformers>=4.48.3", "torch>=2.3", "sentencepiece>=0.2", "protobuf>=4.25"]
 # Reads the QQP parquet files for the semantic-cache benchmark.
 bench = ["pyarrow>=15"]
+# Load, stress, spike, chaos and soak tests (python -m loadtest.run ...).
+load = ["locust==2.31.8", "psutil>=5.9"]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",

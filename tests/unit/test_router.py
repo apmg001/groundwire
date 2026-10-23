@@ -45,7 +45,7 @@ async def test_retry_then_success_on_same_provider() -> None:
 
 async def test_failover_after_retries_exhausted() -> None:
     metrics = GatewayMetrics()
-    primary = ScriptedProvider("primary", ProviderTimeoutError("slow", provider="primary"))
+    primary = ScriptedProvider("primary", ProviderServerError("502", provider="primary"))
     secondary = ScriptedProvider("secondary", "backup answer")
     result = await _router(primary, secondary, metrics).complete("default", chat_request())
 
@@ -53,6 +53,14 @@ async def test_failover_after_retries_exhausted() -> None:
     assert primary.calls == 2  # max_attempts
     assert [a.outcome for a in result.attempts] == ["error", "success"]
     assert metrics.failovers.labels(route="default")._value.get() == 1
+
+
+async def test_timeout_fails_over_without_retrying_the_slow_provider() -> None:
+    primary = ScriptedProvider("primary", ProviderTimeoutError("slow", provider="primary"))
+    result = await _router(primary, ScriptedProvider("secondary", "ok")).complete(
+        "default", chat_request())
+    assert result.provider == "secondary"
+    assert primary.calls == 1  # one full timeout, not two
 
 
 async def test_auth_error_fails_over_without_retry() -> None:
