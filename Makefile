@@ -1,7 +1,13 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
         bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
         gate gate-full gate-calibrate bench-cascade bench-cascade-token \
-        agent agent-risky agent-seq agent-risky-seq agent-liar
+        agent agent-risky agent-seq agent-risky-seq agent-liar \
+        agent-approval agent-approval-manual approvals approve reject
+
+# Reviewer token for the approval API (make run and the approval targets share it).
+# Development default only: set your own secret in any shared or deployed setup.
+GROUNDWIRE_APPROVER_TOKEN ?= dev-approver-token-change-me
+export GROUNDWIRE_APPROVER_TOKEN
 
 install:          ## Install the package with dev tools
 	pip install -e ".[dev]"
@@ -98,3 +104,18 @@ agent-risky-seq:  ## Risky scenario, one tool call per step
 
 agent-liar:       ## No model needed: an agent that misreports its refund; the answer check flags it
 	python scripts/agent_demo.py --model agent-demo-liar --scenario safe
+
+agent-approval:   ## No model needed: a $1,200 refund waits for approval; the demo plays the manager
+	python scripts/agent_demo.py --model agent-demo-approval --scenario approval --auto-approve
+
+agent-approval-manual: ## Same, but YOU approve it from another terminal: make approve ID=apr_...
+	python scripts/agent_demo.py --model agent-demo-approval --scenario approval --wait-approval
+
+approvals:        ## List tool calls waiting for human approval
+	python scripts/approvals.py list
+
+approve:          ## Approve a held call: make approve ID=apr_... [NOTE="..."]
+	python scripts/approvals.py approve $(ID) $(if $(NOTE),--note "$(NOTE)")
+
+reject:           ## Reject a held call: make reject ID=apr_... [NOTE="..."]
+	python scripts/approvals.py reject $(ID) $(if $(NOTE),--note "$(NOTE)")

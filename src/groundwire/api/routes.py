@@ -7,6 +7,8 @@
   open). Kubernetes stops sending traffic while this is failing.
 * ``GET  /metrics``: Prometheus exposition.
 
+Approval routes (``/v1/approvals``) live in :mod:`groundwire.api.approvals`.
+
 Handlers are thin: parse, call the service, frame the response.
 """
 

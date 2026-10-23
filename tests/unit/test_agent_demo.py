@@ -130,3 +130,70 @@ def test_answer_check_supported_and_absent() -> None:
 def test_answer_check_bad_span_does_not_crash() -> None:
     check = {"verdict": "mismatch", "issues": [{"kind": "number_mismatch", "span": [5, 99]}]}
     assert demo.answer_check_lines(check, "short")[1] == "  - '?': number_mismatch"
+
+
+# --------------------------------------------------------------------------- #
+# Human approval
+# --------------------------------------------------------------------------- #
+
+
+class _FakeGateway:
+    """Holds the refund until it is approved, then releases it (like Groundwire)."""
+
+    def __init__(self) -> None:
+        self.status = "pending"
+        self.approve_calls: list[dict[str, Any]] = []
+        self.chat_calls = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/approve"):
+            self.approve_calls.append({"auth": request.headers.get("authorization"),
+                                       "body": json.loads(request.content)})
+            self.status = "approved"
+            return httpx.Response(200, json={"status": "approved"})
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"status": self.status})
+        self.chat_calls += 1
+        messages = json.loads(request.content)["messages"]
+        if messages[-1]["role"] == "tool":
+            return httpx.Response(200, json=_reply("Refunded $1200.", []))
+        if self.status == "pending":
+            held = {"tool": "issue_refund", "decision": "pending_approval",
+                    "approval_id": "apr_" + "1" * 32}
+            return httpx.Response(200, json=_reply("needs approval", [held]))
+        call = {"id": "c1", "type": "function", "function": {
+            "name": "issue_refund", "arguments": '{"order_id": 4417, "amount": 1200}'}}
+        reply = _reply(None, [{"tool": "issue_refund", "decision": "allowed",
+                               "approval_id": "apr_" + "1" * 32}])
+        reply["choices"][0]["message"]["tool_calls"] = [call]
+        return httpx.Response(200, json=reply)
+
+
+def test_auto_approve_releases_the_call_and_finishes() -> None:
+    gateway = _FakeGateway()
+    waiter = demo.ApprovalWaiter(approve_with_token="t" * 20, sleep=lambda _: None)
+    with httpx.Client(base_url="http://gw", transport=httpx.MockTransport(gateway.handler)) as c:
+        run = demo.run_agent(c, "agent-demo-approval", demo.SCENARIOS["approval"],
+                             waiter=waiter)
+    assert run.answer == "Refunded $1200."
+    assert any("HELD issue_refund" in s for s in run.steps)
+    assert any("RELEASED issue_refund" in s for s in run.steps)
+    assert gateway.approve_calls[0]["auth"] == "Bearer " + "t" * 20
+    assert gateway.chat_calls == 3  # held, released, final answer
+
+
+def test_waiter_times_out_while_pending() -> None:
+    gateway = _FakeGateway()
+    ticks = iter(range(0, 1000, 10))
+    waiter = demo.ApprovalWaiter(timeout_s=25, sleep=lambda _: None, clock=lambda: next(ticks))
+    with httpx.Client(base_url="http://gw", transport=httpx.MockTransport(gateway.handler)) as c:
+        assert waiter.wait(c, ["apr_" + "1" * 32]) == {"apr_" + "1" * 32: "pending"}
+
+
+def test_without_a_waiter_the_hold_is_the_answer() -> None:
+    gateway = _FakeGateway()
+    with httpx.Client(base_url="http://gw", transport=httpx.MockTransport(gateway.handler)) as c:
+        run = demo.run_agent(c, "agent-demo-approval", demo.SCENARIOS["approval"])
+    assert run.answer == "needs approval"
+    assert "holding the call for human approval" in run.steps[-1]

@@ -148,6 +148,17 @@ providers:
 
   # Answer-check demo: refunds $1, then tells the user it refunded $49.99 (the
   # exact mistake Qwen 2.5 3B made in a real run). The gateway flags the answer.
+  # Approval demo: a $1,200 refund, above the refund-approval threshold (500).
+  - name: mock-agent-approval
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund of $1200 for order 4417 has been issued."
+      latency_s: 0.01
+      tool_call:
+        name: issue_refund
+        arguments: {order_id: 4417, amount: 1200}
+
   - name: mock-agent-liar
     type: mock
     model: mock-agent
@@ -166,6 +177,7 @@ routes:
   # Tool-calling demo (no API key needed).
   agent-demo: [mock-agent]
   agent-demo-risky: [mock-agent-greedy]   # blocked by tool_policy refund-cap
+  agent-demo-approval: [mock-agent-approval] # held until a reviewer approves (make agent-approval)
   agent-demo-liar: [mock-agent-liar]       # wrong amount in the answer: answer_check flags it
   # A real local model with tool calling: make agent / make agent-risky (needs Ollama running).
   ollama: [ollama-local]
@@ -193,6 +205,14 @@ tool_policy:
   reject_unknown_tools: true   # block tools the request never offered
   default_action: allow        # set to block for an allowlist
   rules:                       # first matching rule wins (like a firewall)
+    # Refunds of 500 or more wait for a human (and are still capped at 5000).
+    - name: refund-approval
+      tools: [issue_refund]
+      action: require_approval
+      when:
+        amount: {min: 500}
+      arguments:
+        amount: {max: 5000}
     - name: refund-cap
       tools: [issue_refund]
       arguments:
@@ -200,6 +220,21 @@ tool_policy:
     - name: no-deletes
       tools: ["delete_*", "drop_*"]
       action: block
+
+# Human approval for tool calls held by a require_approval rule. An approval is
+# permission for one exact call (same tool, arguments and `user`), used once.
+# Reviewers use /v1/approvals with the token in the env var below (the reviewer
+# API is disabled while it is unset). In-memory store: single replica, and
+# pending requests are lost on restart (agents simply ask again).
+approvals:
+  enabled: true
+  store: memory
+  ttl_s: 900                   # a request waits 15 minutes for a decision
+  grant_ttl_s: 600             # an approved call must be used within 10 minutes
+  retention_s: 86400           # decided records stay visible for a day
+  max_records: 10000
+  max_pending_per_scope: 20    # one user cannot flood reviewers
+  reviewer_token_env: GROUNDWIRE_APPROVER_TOKEN
 
 # Fact-check agents' final answers against their tool results (numbers, claimed
 # actions). Catches "I refunded $49.99" when the refund tool returned amount 1.

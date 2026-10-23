@@ -593,6 +593,94 @@ tool results as the context.
 
 ---
 
+## Human approval: risky actions wait for a person
+
+Some actions are fine for an agent to take alone (a $49 refund), some should never happen
+(a $250K refund), and many sit in between: a manager should look first. A rule with
+`action: require_approval` holds the call until a reviewer decides.
+
+```yaml
+tool_policy:
+  rules:
+    - name: refund-approval          # 500 to 5000: a human decides
+      tools: [issue_refund]
+      action: require_approval
+      when: {amount: {min: 500}}     # `when` selects the rule; otherwise the next rule applies
+      arguments: {amount: {max: 5000}}
+    - name: refund-cap               # under 500: allowed; over 5000: blocked
+      tools: [issue_refund]
+      arguments: {amount: {max: 5000}}
+```
+
+**The flow:**
+
+1. The model asks for `issue_refund(order 4417, $1200)`. The gateway holds it, creates
+   approval `apr_…`, and ends the agent's turn with text saying it is waiting.
+2. A reviewer sees exactly what would run and decides: `make approvals`,
+   `make approve ID=apr_… NOTE="customer verified"` (or the API below).
+3. The agent asks again. When the model proposes the **same call**, the gateway releases it,
+   once.
+
+```bash
+make run              # terminal 1 (uses a development reviewer token)
+make agent-approval   # terminal 2: no model needed; the demo plays the manager
+```
+
+```
+[1] gateway HELD issue_refund for human approval (apr_ef79…)
+[1] reviewer decision: apr_ef79… approved
+[2] gateway RELEASED issue_refund: approved by a reviewer (apr_ef79…)
+[2] model called issue_refund({"order_id": 4417, "amount": 1200}) -> {... "status": "refunded"}
+[3] gateway answer check: the answer matches the tool results
+```
+
+**API:**
+
+| Endpoint | Who | Purpose |
+|---|---|---|
+| `GET /v1/approvals/{id}/status` | agent (no token; the random id is the capability) | `pending` / `approved` / `rejected` / `expired` / `consumed` |
+| `GET /v1/approvals?status=pending` | reviewer | list, newest first, with the exact arguments |
+| `GET /v1/approvals/{id}` | reviewer | one record |
+| `POST /v1/approvals/{id}/approve` | reviewer | `{"reviewer": "anita", "note": "..."}` |
+| `POST /v1/approvals/{id}/reject` | reviewer | same body |
+
+Reviewer endpoints need `Authorization: Bearer $GROUNDWIRE_APPROVER_TOKEN`. If the variable is
+unset they refuse every request (fail closed), and held calls simply stay held.
+
+**What makes it safe:**
+
+- **An approval is for one exact call.** The tool, the arguments and the requester (`user`)
+  are hashed together. An approved $1200 refund does not release $60,000, and Alice's approval
+  does not release Carol's identical call.
+- **Used once.** Approval → release is an atomic compare-and-set, so five concurrent requests
+  release it exactly once (tested with forced interleaving, and the test fails if
+  compare-and-set is broken).
+- **Hard limits win.** A call over `arguments` limits is blocked outright, never sent to a
+  reviewer. Injection lockdown, loop limits and schema checks all still apply.
+- **Deadlines.** A request waits `ttl_s` (15 min) for a decision; an approved call must be
+  used within `grant_ttl_s` (10 min). Both are enforced on every read, with no background job
+  that could fail.
+- **Fails closed.** If the approval store fails or is full, the call is blocked
+  (`approval_unavailable`). One `user` can have at most `max_pending_per_scope` open requests.
+- **Audit trail.** Every event (requested, approved, rejected, expired, released) is logged on
+  `groundwire.audit` with ids, tool, rule, user and reviewer, never the arguments; counted in
+  `groundwire_approvals_total{event}` and `groundwire_approvals_pending`.
+
+**Design:** the approvals package is hexagonal like the cache. A pure domain model
+(record, lifecycle, fingerprint); an `ApprovalStore` port with one atomic primitive
+(`compare_and_set`); an in-memory adapter; and an `ApprovalService` that owns every rule.
+`ToolGate` composes the pure policy with the service, so the chat service makes one call and
+never knows about approvals.
+
+**Limits, stated plainly:** the in-memory store is single-replica and loses pending requests
+on restart (safe: nothing runs unapproved, and agents ask again). A Redis or Postgres adapter
+only needs to implement the store port. Release depends on the model proposing the same call
+again, which deterministic agents do; a model that changes the arguments needs a new approval
+(by design). With one shared reviewer token the reviewer name is self-declared; per-reviewer
+identity (SSO) is the next step for real deployments.
+
+---
+
 ## Quality gates: CI fails if accuracy drops
 
 The benchmark numbers above are enforced, not just reported. `config/quality_gates.yaml` defines
@@ -695,7 +783,8 @@ src/groundwire/
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
-  agents/         tool-call policy engine, JSON Schema argument checks, answer check
+  agents/         tool policy, ToolGate (policy + approvals), schema checks, answer check
+  approvals/      human approval: domain model, store port + in-memory adapter, service
   evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
                   QQP loader + cachebench/ (semantic-cache benchmark);
                   cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
@@ -728,6 +817,8 @@ scripts/          chaos demo
 - [x] Tool-call guardrails: ordered rules, argument limits, schema checks, injection lockdown,
       loop limit (OWASP LLM06/LLM10)
 - [x] Answer check: agents' final answers checked against tool results (numbers, claimed actions)
+- [x] Human approval for risky tool calls (exact-call, single-use, scoped, audited)
+- [ ] Redis/Postgres approval store and per-reviewer identity
 - [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas

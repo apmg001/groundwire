@@ -21,6 +21,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from groundwire import __version__
+from groundwire.api.approvals import router as approvals_router
 from groundwire.api.errors import register_exception_handlers
 from groundwire.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from groundwire.api.routes import router
@@ -79,6 +80,7 @@ def create_app(
     app = FastAPI(title="Groundwire", version=__version__, lifespan=lifespan,
                   docs_url="/docs", redoc_url=None)
     app.include_router(router)
+    app.include_router(approvals_router)
     register_exception_handlers(app)
     # Order: outermost first. Request context wraps everything so even 413s
     # get a request ID and an access-log line.

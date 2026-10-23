@@ -17,6 +17,8 @@ services:
       GROUNDWIRE_LOG_LEVEL: INFO
       GROUNDWIRE_LOG_JSON: "true"
       GROUNDWIRE_CONFIG_PATH: /app/config/groundwire.docker.yaml
+      # Reviewer API token for /v1/approvals (reviewer API is off while empty).
+      GROUNDWIRE_APPROVER_TOKEN: "${GROUNDWIRE_APPROVER_TOKEN:-}"
       # Cloud fallbacks (only used if enabled in the config):
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

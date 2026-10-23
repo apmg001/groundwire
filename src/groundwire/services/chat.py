@@ -8,8 +8,9 @@ Responsibilities (and nothing else):
   in-flight requests into one provider call,
 * run cascade routes (cheap model first, strong model only when the answer
   fails the fact-check) through :class:`CascadeRunner`,
-* enforce the tool policy on every tool call a model requests, after PII is
-  restored and before the client (the agent) receives it,
+* enforce the tool gate on every tool call a model requests, after PII is
+  restored and before the client (the agent) receives it: policy rules, and
+  human approval for calls a rule holds,
 * fact-check an agent's final answer against the tool results in the
   conversation (numbers and claimed actions), and flag/annotate/block it,
 * enforce the end-to-end deadline across retries and failover,
@@ -45,17 +46,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from groundwire.agents.answer_check import AnswerChecker, AnswerCheckReport
-from groundwire.agents.policy import PolicyResult, ToolPolicy
+from groundwire.agents.gate import ToolGate
+from groundwire.agents.policy import PolicyResult
 from groundwire.cache.service import CacheLookup, CacheStatus, ResponseCache
 from groundwire.cache.singleflight import SingleFlight
-from groundwire.core.config import AnswerCheckAction, ToolViolationHandling
+from groundwire.core.config import AnswerCheckAction
 from groundwire.core.errors import (
     AnswerCheckFailedError,
     GatewayTimeoutError,
     GroundingViolationError,
     GroundwireError,
     InvalidRequestError,
-    ToolCallBlockedError,
 )
 from groundwire.domain.models import (
     AssistantMessage,
@@ -135,7 +136,7 @@ class ChatService:
         safety: SafetyGuard | None = None,
         cache: ResponseCache | None = None,
         cascade: CascadeRunner | None = None,
-        tool_policy: ToolPolicy | None = None,
+        tool_gate: ToolGate | None = None,
         answer_checker: AnswerChecker | None = None,
     ) -> None:
         """Create the service.
@@ -150,7 +151,8 @@ class ChatService:
             cache: Response cache; ``None`` disables caching and coalescing.
             cascade: Cascade runner (built from ``router`` and ``verifier`` if
                 omitted; it only acts on routes configured as cascades).
-            tool_policy: Guardrails for model tool calls; ``None`` disables them.
+            tool_gate: Guardrails (policy and human approval) for model tool calls;
+                ``None`` disables them.
             answer_checker: Fact-check of final answers against tool results;
                 ``None`` disables it.
         """
@@ -161,7 +163,7 @@ class ChatService:
         self._safety = safety
         self._cache = cache
         self._cascade = cascade or CascadeRunner(router, verifier, metrics=metrics)
-        self._tool_policy = tool_policy
+        self._tool_gate = tool_gate
         self._answer_checker = answer_checker
         self._flights: SingleFlight[_Answer] = SingleFlight()
 
@@ -228,10 +230,11 @@ class ChatService:
 
         text = self._restore(answer.completion.text, prepared)
         proposed = self._restore_calls(answer.completion.tool_calls, prepared)
-        calls, policy = self._enforce_tools(proposed, request, prepared)
+        calls, policy = await self._enforce_tools(proposed, request, prepared)
         finish_reason = answer.completion.finish_reason
         if policy is not None and proposed and not calls:
-            # Every call was blocked: answer in text, so the agent loop ends cleanly.
+            # No call can run now (blocked or waiting for approval): answer in text,
+            # so the agent loop ends cleanly.
             text = (text + "\n\n" if text.strip() else "") + policy.explanation()
             finish_reason = "stop"
         meta: dict[str, Any] = {
@@ -532,18 +535,18 @@ class ChatService:
             request)
         collect_text = grounding is not None or check_answer
 
-        def release_calls() -> dict[str, Any] | None:
+        async def release_calls() -> dict[str, Any] | None:
             nonlocal calls, policy_result, released
             if not assembler or released:
                 return None
             released = True
             proposed = self._restore_calls(assembler.calls(), prepared)
-            calls, policy_result = self._enforce_tools(proposed, request, prepared)
+            calls, policy_result = await self._enforce_tools(proposed, request, prepared)
             stamp = {"id": stream_id, "created": created, "model": request.model}
             if calls:
                 return StreamChunk.tool_calls(calls, role=not sent_text).model_copy(
                     update=stamp).model_dump(exclude_none=True)
-            if policy_result is not None:  # every call was blocked: explain in text
+            if policy_result is not None:  # no call can run now: explain in text
                 prefix = "\n\n" if sent_text else ""
                 return StreamChunk.text(prefix + policy_result.explanation(),
                                         role=not sent_text).model_copy(
@@ -576,7 +579,7 @@ class ChatService:
                     parts.append(chunk.content())
                 finishing = any(c.finish_reason is not None for c in chunk.choices)
                 if finishing:
-                    ready = release_calls()  # complete calls go out before the finish marker
+                    ready = await release_calls()  # complete calls go out before the finish marker
                     if ready is not None:
                         yield ready
                     if policy_result is not None and not calls:
@@ -594,7 +597,7 @@ class ChatService:
                     yield StreamChunk.text(tail).model_copy(update={
                         "id": stream_id, "created": created, "model": request.model,
                     }).model_dump(exclude_none=True)
-            ready = release_calls()  # stream ended without a finish marker
+            ready = await release_calls()  # stream ended without a finish marker
             if ready is not None:
                 yield ready
 
@@ -745,39 +748,31 @@ class ChatService:
         grounding = request.groundwire.grounding if request.groundwire else None
         return self._safety.prepare(request, grounding.context if grounding else None)
 
-    def _enforce_tools(self, calls: list[ToolCall], request: ChatCompletionRequest,
-                       prepared: PreparedRequest) -> tuple[list[ToolCall], PolicyResult | None]:
-        """Apply the tool policy to the calls a model requested.
+    async def _enforce_tools(self, calls: list[ToolCall], request: ChatCompletionRequest,
+                             prepared: PreparedRequest
+                             ) -> tuple[list[ToolCall], PolicyResult | None]:
+        """Run the tool gate on the calls a model requested.
 
-        Runs on PII-restored calls, so rules see real values (an email-domain
-        rule must see the real address, not ``[EMAIL_1]``).
+        Runs on PII-restored calls, so rules and approvals see real values (an
+        email-domain rule must see the real address, not ``[EMAIL_1]``).
 
         Args:
             calls: Proposed calls.
-            request: The client's request (offered tools, history).
+            request: The client's request (offered tools, history, ``user``).
             prepared: Safety-processed request (injection verdict).
 
         Returns:
-            ``(allowed_calls, result)``; ``result`` is ``None`` when the policy
+            ``(calls_to_release, result)``; ``result`` is ``None`` when the gate
             is off or there were no calls.
 
         Raises:
             ToolCallBlockedError: A call was blocked and ``on_violation`` is ``error``.
         """
-        policy = self._tool_policy
-        if not calls or policy is None or not policy.enabled:
+        gate = self._tool_gate
+        if gate is None:
             return calls, None
-        result = policy.evaluate(calls, request,
-                                 injection_suspected=prepared.injection_action != "none")
-        for decision in result.decisions:
-            self._metrics.tool_calls.labels(
-                decision="allowed" if decision.allowed else "blocked",
-                reason=decision.reason.value if decision.reason else "").inc()
-        if result.blocked and policy.on_violation is ToolViolationHandling.ERROR:
-            raise ToolCallBlockedError(
-                "the model requested a tool call that the tool policy forbids",
-                details={"tools": result.as_dict()})
-        return result.allowed_calls, result
+        return await gate.enforce(calls, request,
+                                  injection_suspected=prepared.injection_action != "none")
 
     def _answer_check_action(self) -> AnswerCheckAction | None:
         """The configured answer-check action, or ``None`` when the check is off."""

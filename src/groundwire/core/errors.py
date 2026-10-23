@@ -282,6 +282,48 @@ class ToolCallBlockedError(GroundwireError):
     code = "tool_call_blocked"
 
 
+class ApprovalNotFoundError(GroundwireError):
+    """No approval with this id (never existed, or purged after retention)."""
+
+    http_status = 404
+    code = "approval_not_found"
+
+
+class ApprovalConflictError(GroundwireError):
+    """The approval was already decided (or changed concurrently)."""
+
+    http_status = 409
+    code = "approval_already_decided"
+
+
+class ApprovalExpiredError(GroundwireError):
+    """The approval expired before a decision was made."""
+
+    http_status = 410
+    code = "approval_expired"
+
+
+class ApprovalsDisabledError(GroundwireError):
+    """Approvals, or the reviewer API, are not enabled on this gateway."""
+
+    http_status = 503
+    code = "approvals_disabled"
+
+
+class ReviewerAuthError(GroundwireError):
+    """Missing or wrong reviewer token."""
+
+    http_status = 401
+    code = "unauthorized"
+
+
+class ApprovalStoreError(GroundwireError):
+    """The approval store failed or is full (callers fail closed)."""
+
+    http_status = 503
+    code = "approval_store_unavailable"
+
+
 class AnswerCheckFailedError(GroundwireError):
     """An agent's answer contradicts its tool results and the policy is ``block``."""
 

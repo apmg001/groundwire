@@ -103,6 +103,14 @@ class GatewayMetrics:
         self.tool_calls = Counter(
             "groundwire_tool_calls_total", "Tool calls requested by models, by policy verdict.",
             ["decision", "reason"], registry=r)
+        self.approvals = Counter(
+            "groundwire_approvals_total",
+            "Approval lifecycle events (requested, deduplicated, approved, rejected, "
+            "expired, released, unavailable).",
+            ["event"], registry=r)
+        self.approvals_pending = Gauge(
+            "groundwire_approvals_pending", "Approval requests waiting for a reviewer.",
+            registry=r)
         self.answer_checks = Counter(
             "groundwire_answer_checks_total",
             "Agent answers fact-checked against tool results, by verdict.",

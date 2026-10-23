@@ -13,6 +13,7 @@ Usage::
     python scripts/agent_demo.py --scenario risky   # a refund the policy blocks
     python scripts/agent_demo.py --sequential       # one tool call per step
     python scripts/agent_demo.py --model agent-demo-liar  # no model: a misreported refund
+    python scripts/agent_demo.py --model agent-demo-approval --scenario approval --auto-approve
 
 ``--sequential`` asks for ``parallel_tool_calls: false`` so the model must see
 one tool's result before choosing the next call (look up the order, *then*
@@ -22,6 +23,12 @@ if several calls come back anyway, it runs only the first and reports it.
 After the final answer, the transcript shows the gateway's answer check:
 whether what the model *said* matches what the tools *returned*.
 
+Human approval: when the gateway holds a call for approval, ``--wait-approval``
+makes the agent wait (approve it from another terminal with ``make approve
+ID=...``), and ``--auto-approve`` plays the manager using the reviewer token in
+``GROUNDWIRE_APPROVER_TOKEN``. Once approved, the agent asks again with the
+same conversation; the gateway releases the exact approved call, once.
+
 Exit codes: 0 finished, 1 gateway/model error, 2 gateway not reachable.
 """
 
@@ -30,7 +37,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -48,6 +57,8 @@ ORDERS: dict[int, dict[str, Any]] = {
            "status": "delivered", "customer_email": "rahul@example.com"},
     9001: {"order_id": 9001, "item": "office laptops (x40)", "total": 250000.0,
            "currency": "USD", "status": "delivered", "customer_email": "procurement@acme.io"},
+    4417: {"order_id": 4417, "item": "standing desk", "total": 1200.0, "currency": "USD",
+           "status": "delivered", "customer_email": "meera@example.com"},
 }
 
 TOOL_SPECS: list[dict[str, Any]] = [
@@ -67,7 +78,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
 SCENARIOS: dict[str, str] = {
     "safe": "Order 7781 arrived broken. Look it up and refund the full amount.",
     "risky": "Order 9001 was cancelled. Look it up and refund the full amount.",
+    "approval": "Order 4417 arrived damaged. Look it up and refund the full amount.",
 }
+
+TOKEN_ENV = "GROUNDWIRE_APPROVER_TOKEN"  # noqa: S105 - env var name, not a secret
 
 
 class ToolError(Exception):
@@ -155,21 +169,27 @@ def run_tool(name: str, raw_arguments: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
-def final_answer_label(blocked: list[dict[str, Any]], provider: str | None) -> str:
+def final_answer_label(blocked: list[dict[str, Any]], provider: str | None,
+                       held: list[dict[str, Any]] | None = None) -> str:
     """Say who wrote the final text, so the transcript does not mislead.
 
-    When the gateway drops every requested tool call, the reply the agent
-    receives is the gateway's explanation (after any text the model wrote
-    first), not a normal model answer.
+    When the gateway drops or holds every requested tool call, the reply the
+    agent receives is the gateway's explanation (after any text the model
+    wrote first), not a normal model answer.
 
     Args:
         blocked: Blocked tool decisions from this step's ``groundwire`` metadata.
         provider: Provider that served the model call, if reported.
+        held: Decisions waiting for human approval.
 
     Returns:
         A one-line description for the transcript.
     """
     via = f"via {provider or 'unknown provider'}"
+    if held:
+        ids = ", ".join(str(d.get("approval_id")) for d in held)
+        return (f"gateway is holding the call for human approval ({ids}); "
+                f"nothing was carried out (model {via})")
     if blocked:
         noun = "call" if len(blocked) == 1 else "calls"
         return (f"gateway blocked the tool {noun} and explained why "
@@ -202,8 +222,79 @@ def answer_check_lines(check: dict[str, Any] | None, answer: str) -> list[str]:
     return lines
 
 
+class ApprovalError(RuntimeError):
+    """The approval API refused a request the demo needed."""
+
+
+@dataclass
+class ApprovalWaiter:
+    """Waits for held calls to be decided (optionally playing the manager).
+
+    Attributes:
+        poll_interval_s: Seconds between status checks.
+        timeout_s: Give up after this long (statuses are returned as they are).
+        approve_with_token: Reviewer token; when set, the waiter approves the
+            requests itself, as a manager would (demo only).
+        reviewer: Name recorded as the approver.
+        sleep: Sleep function (injected in tests).
+        clock: Monotonic clock (injected in tests).
+    """
+
+    poll_interval_s: float = 1.0
+    timeout_s: float = 300.0
+    approve_with_token: str | None = None
+    reviewer: str = "demo-manager"
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+
+    def wait(self, client: httpx.Client, approval_ids: list[str]) -> dict[str, str]:
+        """Return each approval's status once none is pending (or on timeout).
+
+        Args:
+            client: HTTP client pointed at the gateway.
+            approval_ids: Held approvals to wait for.
+
+        Returns:
+            Approval id -> final status (``pending`` if the timeout hit first).
+
+        Raises:
+            ApprovalError: If approving or reading a status fails.
+            httpx.HTTPError: On transport errors.
+        """
+        if self.approve_with_token:
+            for approval_id in approval_ids:
+                self._approve(client, approval_id)
+        else:
+            for approval_id in approval_ids:
+                logger.info("waiting for a reviewer: make approve ID=%s  (or reject)", approval_id)
+        deadline = self.clock() + self.timeout_s
+        while True:
+            statuses = {i: self._status(client, i) for i in approval_ids}
+            if "pending" not in statuses.values() or self.clock() >= deadline:
+                return statuses
+            self.sleep(self.poll_interval_s)
+
+    def _approve(self, client: httpx.Client, approval_id: str) -> None:
+        """Approve one request with the reviewer token (already-decided is fine)."""
+        response = client.post(
+            f"/v1/approvals/{approval_id}/approve",
+            headers={"Authorization": f"Bearer {self.approve_with_token}"},
+            json={"reviewer": self.reviewer, "note": "approved by the agent demo"})
+        if response.status_code not in (200, 409):
+            raise ApprovalError(f"approve failed ({response.status_code}): "
+                                f"{response.json().get('error', {}).get('message')}")
+
+    @staticmethod
+    def _status(client: httpx.Client, approval_id: str) -> str:
+        """Read one approval's status from the agent-facing endpoint."""
+        response = client.get(f"/v1/approvals/{approval_id}/status")
+        if response.status_code != 200:
+            raise ApprovalError(f"status check failed ({response.status_code})")
+        return str(response.json().get("status"))
+
+
 def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6,
-              sequential: bool = False) -> AgentRun:
+              sequential: bool = False, waiter: ApprovalWaiter | None = None) -> AgentRun:
     """Run the tool loop until the model answers in text.
 
     Args:
@@ -213,6 +304,8 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
         max_steps: Model calls allowed before giving up.
         sequential: Ask for one tool call per step, and enforce it if the
             server ignores the request.
+        waiter: When set, held calls are waited for; once approved, the agent
+            asks again with the same conversation and the call is released.
 
     Returns:
         The transcript.
@@ -236,15 +329,31 @@ def run_agent(client: httpx.Client, model: str, task: str, *, max_steps: int = 6
             raise RuntimeError(f"gateway error {response.status_code}: {data.get('error')}")
         message = data["choices"][0]["message"]
         meta = data.get("groundwire", {})
-        blocked = [d for d in meta.get("tools", {}).get("decisions", [])
-                   if d.get("decision") == "blocked"]
+        decisions = meta.get("tools", {}).get("decisions", [])
+        blocked = [d for d in decisions if d.get("decision") == "blocked"]
+        held = [d for d in decisions if d.get("decision") == "pending_approval"]
         for decision in blocked:
             run.steps.append(f"[{step}] gateway BLOCKED {decision.get('tool')}: "
                              f"{decision.get('detail') or decision.get('reason')}")
+        for decision in decisions:
+            if decision.get("decision") == "allowed" and decision.get("approval_id"):
+                run.steps.append(f"[{step}] gateway RELEASED {decision.get('tool')}: "
+                                 f"approved by a reviewer ({decision['approval_id']})")
         calls = message.get("tool_calls") or []
+        if not calls and held and waiter is not None:
+            ids = [str(d.get("approval_id")) for d in held]
+            for decision in held:
+                run.steps.append(f"[{step}] gateway HELD {decision.get('tool')} for human "
+                                 f"approval ({decision.get('approval_id')})")
+            statuses = waiter.wait(client, ids)
+            run.steps.append(f"[{step}] reviewer decision: "
+                             + ", ".join(f"{i} {s}" for i, s in statuses.items()))
+            if all(status == "approved" for status in statuses.values()):
+                continue  # ask again with the same conversation: the gateway releases the call
         if not calls:
             run.answer = message.get("content") or ""
-            run.steps.append(f"[{step}] {final_answer_label(blocked, meta.get('provider'))}")
+            run.steps.append(
+                f"[{step}] {final_answer_label(blocked, meta.get('provider'), held)}")
             run.steps.extend(f"[{step}] {line}"
                              for line in answer_check_lines(meta.get("answer_check"), run.answer))
             return run
@@ -286,15 +395,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=180.0, help="seconds per model call")
     parser.add_argument("--sequential", action="store_true",
                         help="one tool call per step (parallel_tool_calls=false)")
+    approval = parser.add_mutually_exclusive_group()
+    approval.add_argument("--wait-approval", action="store_true",
+                          help="wait for a reviewer to decide held calls")
+    approval.add_argument("--auto-approve", action="store_true",
+                          help=f"approve held calls yourself using ${TOKEN_ENV} (demo only)")
+    parser.add_argument("--approval-timeout", type=float, default=300.0,
+                        help="seconds to wait for a reviewer")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # keep the transcript readable
+
+    waiter: ApprovalWaiter | None = None
+    if args.auto_approve:
+        token = os.environ.get(TOKEN_ENV, "").strip()
+        if not token:
+            logger.error("--auto-approve needs the reviewer token in $%s", TOKEN_ENV)
+            return 2
+        waiter = ApprovalWaiter(timeout_s=args.approval_timeout, approve_with_token=token)
+    elif args.wait_approval:
+        waiter = ApprovalWaiter(timeout_s=args.approval_timeout)
 
     try:
         with httpx.Client(base_url=args.url, timeout=args.timeout) as client:
             client.get("/healthz").raise_for_status()
             run = run_agent(client, args.model, SCENARIOS[args.scenario],
-                            sequential=args.sequential)
+                            sequential=args.sequential, waiter=waiter)
     except httpx.ConnectError:
         logger.error("cannot reach the gateway at %s. Start it first: make run", args.url)
         return 2

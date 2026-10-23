@@ -8,12 +8,18 @@ swap any piece (e.g. inject fake providers) through :func:`build_container`.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
+from pydantic import SecretStr
+
 from groundwire.agents.answer_check import AnswerChecker
+from groundwire.agents.gate import ToolGate
 from groundwire.agents.policy import ToolPolicy
+from groundwire.approvals import ApprovalService, build_approval_service
 from groundwire.cache import ResponseCache, build_cache
-from groundwire.core.config import GatewayConfig
+from groundwire.core.config import ApprovalConfig, GatewayConfig
+from groundwire.core.errors import ConfigurationError
 from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.providers.base import Provider
@@ -24,6 +30,8 @@ from groundwire.safety.guard import SafetyGuard
 from groundwire.services.chat import ChatService
 
 logger = logging.getLogger(__name__)
+
+MIN_REVIEWER_TOKEN_LENGTH = 16
 
 
 @dataclass(slots=True)
@@ -39,6 +47,8 @@ class Container:
         safety: Prompt-injection and PII guard.
         cache: Response cache (``None`` when disabled).
         chat: Chat completion service.
+        approvals: Human-approval service (``None`` when disabled).
+        reviewer_token: Token for the reviewer API (``None``: reviewer API off).
     """
 
     config: GatewayConfig
@@ -49,10 +59,14 @@ class Container:
     safety: SafetyGuard
     cache: ResponseCache | None
     chat: ChatService
+    approvals: ApprovalService | None = None
+    reviewer_token: SecretStr | None = None
 
     async def aclose(self) -> None:
-        """Release provider connection pools."""
+        """Release provider connection pools and the approval store."""
         await close_providers(self.providers)
+        if self.approvals is not None:
+            await self.approvals.aclose()
         logger.info("container closed")
 
 
@@ -89,10 +103,39 @@ def build_container(
     guard = safety or SafetyGuard(config.safety, metrics=metrics)
     response_cache = cache or build_cache(config.cache, metrics=metrics)
     cascade = CascadeRunner(router, grounding, metrics=metrics)
+    approvals = build_approval_service(config.approvals, metrics=metrics)
+    gate = ToolGate(ToolPolicy(config.tool_policy), approvals=approvals, metrics=metrics)
     chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
-                       safety=guard, cache=response_cache, cascade=cascade,
-                       tool_policy=ToolPolicy(config.tool_policy),
+                       safety=guard, cache=response_cache, cascade=cascade, tool_gate=gate,
                        answer_checker=AnswerChecker(config.answer_check))
     return Container(config=config, providers=built_providers, metrics=metrics,
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
-                     chat=chat)
+                     chat=chat, approvals=approvals,
+                     reviewer_token=_reviewer_token(config.approvals))
+
+
+def _reviewer_token(config: ApprovalConfig) -> SecretStr | None:
+    """Read the reviewer API token from the environment.
+
+    Args:
+        config: Approval settings (names the environment variable).
+
+    Returns:
+        The token, or ``None`` when approvals are off or the variable is unset
+        (the reviewer API then refuses every request: fail closed).
+
+    Raises:
+        ConfigurationError: If the token is set but too short to be safe.
+    """
+    if not config.enabled:
+        return None
+    raw = os.environ.get(config.reviewer_token_env, "").strip()
+    if not raw:
+        logger.warning("reviewer API disabled: set %s to approve or reject tool calls",
+                       config.reviewer_token_env)
+        return None
+    if len(raw) < MIN_REVIEWER_TOKEN_LENGTH:
+        raise ConfigurationError(
+            f"{config.reviewer_token_env} must be at least {MIN_REVIEWER_TOKEN_LENGTH} "
+            "characters")
+    return SecretStr(raw)

@@ -13,10 +13,17 @@ Checks for every call, in order (the first failing check blocks the call):
    turns, so the agent is probably stuck (OWASP LLM10, unbounded consumption);
 3. **unknown tool**: the model asked for a tool the request never offered
    (models do invent tool names);
-4. **rules**: the first rule whose name pattern matches decides allow/block
-   (firewall-style: read top to bottom, first match wins);
+4. **rules**: the first rule that matches decides allow / block / require
+   approval (firewall-style: read top to bottom, first match wins). A rule
+   matches when the tool name matches and all its ``when`` conditions hold,
+   which enables tiers such as "refunds of 500 or more need approval";
 5. **arguments are valid**: a JSON object matching the tool's own schema;
 6. **argument limits** from the matching rule (``amount <= 5000``...).
+
+A call that passes every check under a ``require_approval`` rule gets the
+verdict ``NEEDS_APPROVAL``. This module stays pure (no I/O): resolving that
+verdict against the approval store is the job of
+:class:`~groundwire.agents.gate.ToolGate`.
 
 Decisions never contain argument values (they often hold personal data);
 they say *which* tool, *what* was decided and *why*.
@@ -28,7 +35,7 @@ import fnmatch
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -56,6 +63,17 @@ class BlockReason(StrEnum):
     RULE = "rule"
     INVALID_ARGUMENTS = "invalid_arguments"
     ARGUMENT_LIMIT = "argument_limit"
+    APPROVAL_REJECTED = "approval_rejected"
+    APPROVAL_UNAVAILABLE = "approval_unavailable"
+
+
+class ToolVerdict(StrEnum):
+    """The outcome for one call (stable values used in metadata and metrics)."""
+
+    ALLOWED = "allowed"
+    BLOCKED = "blocked"
+    NEEDS_APPROVAL = "needs_approval"  # policy says a human must approve (not yet resolved)
+    PENDING_APPROVAL = "pending_approval"  # held: waiting for a reviewer
 
 
 # --------------------------------------------------------------------------- #
@@ -65,32 +83,69 @@ class BlockReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ToolDecision:
-    """The verdict on one tool call.
+    """The verdict on one call.
 
     Attributes:
         call: The call.
-        allowed: Whether it may proceed.
-        reason: Why it was blocked (``None`` when allowed).
+        verdict: What happens to it.
+        reason: Why it was blocked (``None`` unless blocked).
         detail: Human-readable explanation, without argument values.
         rule: Name of the deciding rule, if any.
+        approval_id: Approval record involved (held or released calls).
     """
 
     call: ToolCall
-    allowed: bool
+    verdict: ToolVerdict
     reason: BlockReason | None = None
     detail: str | None = None
     rule: str | None = None
+    approval_id: str | None = None
+
+    @property
+    def allowed(self) -> bool:
+        """True if the call may proceed now."""
+        return self.verdict is ToolVerdict.ALLOWED
+
+    @classmethod
+    def allow(cls, call: ToolCall, rule: str | None = None) -> ToolDecision:
+        """An allowed call."""
+        return cls(call, ToolVerdict.ALLOWED, rule=rule)
+
+    @classmethod
+    def block(cls, call: ToolCall, reason: BlockReason, detail: str,
+              rule: str | None = None) -> ToolDecision:
+        """A blocked call."""
+        return cls(call, ToolVerdict.BLOCKED, reason, detail, rule)
+
+    def resolved(self, verdict: ToolVerdict, *, reason: BlockReason | None = None,
+                 detail: str | None = None, approval_id: str | None = None) -> ToolDecision:
+        """Return this decision with the approval outcome applied.
+
+        Args:
+            verdict: Final verdict.
+            reason: Block reason, for blocked calls.
+            detail: Explanation (keeps the current one if omitted).
+            approval_id: Approval record involved.
+
+        Returns:
+            The updated decision.
+        """
+        return replace(self, verdict=verdict, reason=reason,
+                       detail=detail if detail is not None else self.detail,
+                       approval_id=approval_id)
 
     def as_dict(self) -> dict[str, Any]:
         """JSON-serialisable view (no argument values)."""
         data: dict[str, Any] = {"tool": self.call.function.name, "id": self.call.id,
-                                "decision": "allowed" if self.allowed else "blocked"}
+                                "decision": self.verdict.value}
         if self.reason is not None:
             data["reason"] = self.reason.value
         if self.detail is not None:
             data["detail"] = self.detail
         if self.rule is not None:
             data["rule"] = self.rule
+        if self.approval_id is not None:
+            data["approval_id"] = self.approval_id
         return data
 
 
@@ -112,22 +167,45 @@ class PolicyResult:
     @property
     def blocked(self) -> list[ToolDecision]:
         """Blocked verdicts."""
-        return [d for d in self.decisions if not d.allowed]
+        return [d for d in self.decisions if d.verdict is ToolVerdict.BLOCKED]
+
+    @property
+    def held(self) -> list[ToolDecision]:
+        """Calls waiting for a reviewer."""
+        return [d for d in self.decisions if d.verdict is ToolVerdict.PENDING_APPROVAL]
+
+    @property
+    def needs_approval(self) -> list[ToolDecision]:
+        """Calls the policy wants approved and that have not been resolved yet."""
+        return [d for d in self.decisions if d.verdict is ToolVerdict.NEEDS_APPROVAL]
 
     def as_dict(self) -> dict[str, Any]:
         """Response metadata."""
-        return {"decisions": [d.as_dict() for d in self.decisions],
-                "blocked": len(self.blocked)}
+        data: dict[str, Any] = {"decisions": [d.as_dict() for d in self.decisions],
+                                "blocked": len(self.blocked)}
+        if self.held:
+            data["pending_approval"] = len(self.held)
+        return data
 
     def explanation(self) -> str:
-        """Text for the client when every call was blocked (no argument values).
+        """Text for the client when no call could proceed (no argument values).
 
         Returns:
-            A short sentence naming each blocked tool and why.
+            One sentence per outcome: held calls (with approval ids, so the
+            agent can poll them) and blocked calls (with the reason).
         """
-        parts = [f"{d.call.function.name} ({d.detail or d.reason})" for d in self.blocked]
-        return ("The requested action was not carried out because it was blocked by "
-                "policy: " + "; ".join(parts) + ".")
+        sentences: list[str] = []
+        if self.held:
+            parts = [f"{d.call.function.name} (approval {d.approval_id})" for d in self.held]
+            sentences.append("The requested action needs human approval before it can run: "
+                             + "; ".join(parts) + ". It has not been carried out yet. Once it "
+                             "is approved, ask again and it will go through.")
+        unresolved = self.blocked + self.needs_approval
+        if unresolved:
+            parts = [f"{d.call.function.name} ({d.detail or d.reason})" for d in unresolved]
+            sentences.append("The requested action was not carried out because it was "
+                             "blocked by policy: " + "; ".join(parts) + ".")
+        return " ".join(sentences)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,44 +261,78 @@ class ToolPolicy:
         name = call.function.name
         config = self._config
         if config.injection_lockdown and injection_suspected:
-            return ToolDecision(call, False, BlockReason.INJECTION_LOCKDOWN,
-                                "possible prompt injection in this request")
+            return ToolDecision.block(call, BlockReason.INJECTION_LOCKDOWN,
+                                      "possible prompt injection in this request")
         if rounds >= config.max_tool_rounds:
-            return ToolDecision(call, False, BlockReason.TOO_MANY_ROUNDS,
-                                f"more than {config.max_tool_rounds} tool rounds")
+            return ToolDecision.block(call, BlockReason.TOO_MANY_ROUNDS,
+                                      f"more than {config.max_tool_rounds} tool rounds")
         if config.reject_unknown_tools and name not in offered:
-            return ToolDecision(call, False, BlockReason.UNKNOWN_TOOL,
-                                "tool was not offered in this request")
+            return ToolDecision.block(call, BlockReason.UNKNOWN_TOOL,
+                                      "tool was not offered in this request")
 
-        rule = self._match(name)
+        arguments = call.parsed_arguments()
+        rule = self._match(name, arguments)
         rule_name = (rule.name or ",".join(rule.tools)) if rule else None
         action = rule.action if rule else config.default_action
         if action is ToolAction.BLOCK:
-            return ToolDecision(call, False, BlockReason.RULE, "blocked by rule", rule_name)
+            return ToolDecision.block(call, BlockReason.RULE, "blocked by rule", rule_name)
 
-        arguments = call.parsed_arguments()
         if arguments is None:
-            return ToolDecision(call, False, BlockReason.INVALID_ARGUMENTS,
-                                "arguments are not a JSON object", rule_name)
+            return ToolDecision.block(call, BlockReason.INVALID_ARGUMENTS,
+                                      "arguments are not a JSON object", rule_name)
         if config.validate_arguments:
             problems = validate(arguments, offered.get(name))
             if problems:
-                return ToolDecision(call, False, BlockReason.INVALID_ARGUMENTS,
-                                    "; ".join(problems), rule_name)
+                return ToolDecision.block(call, BlockReason.INVALID_ARGUMENTS,
+                                          "; ".join(problems), rule_name)
         if rule is not None:
             for path, constraint in rule.arguments.items():
                 problem = check_constraint(path, _lookup(arguments, path), constraint)
                 if problem is not None:
-                    return ToolDecision(call, False, BlockReason.ARGUMENT_LIMIT, problem,
-                                        rule_name)
-        return ToolDecision(call, True, rule=rule_name)
+                    return ToolDecision.block(call, BlockReason.ARGUMENT_LIMIT, problem,
+                                              rule_name)
+        if action is ToolAction.REQUIRE_APPROVAL:
+            return ToolDecision(call, ToolVerdict.NEEDS_APPROVAL,
+                                detail="needs human approval", rule=rule_name)
+        return ToolDecision.allow(call, rule_name)
 
-    def _match(self, name: str) -> ToolRule | None:
-        """First rule whose pattern matches ``name`` (case-sensitive), or ``None``."""
+    def _match(self, name: str, arguments: dict[str, Any] | None) -> ToolRule | None:
+        """First rule whose pattern matches ``name`` and whose ``when`` holds, or ``None``.
+
+        Args:
+            name: Tool name (matched case-sensitively).
+            arguments: Decoded arguments (``None`` if invalid: rules with
+                ``when`` conditions then cannot match, and the call is blocked
+                later as invalid anyway).
+
+        Returns:
+            The deciding rule.
+        """
         for rule in self._config.rules:
-            if any(fnmatch.fnmatchcase(name, pattern) for pattern in rule.tools):
-                return rule
+            if not any(fnmatch.fnmatchcase(name, pattern) for pattern in rule.tools):
+                continue
+            if rule.when and (arguments is None or not _conditions_hold(arguments, rule.when)):
+                continue
+            return rule
         return None
+
+
+def _conditions_hold(arguments: dict[str, Any],
+                     conditions: dict[str, ArgumentConstraint]) -> bool:
+    """True if every ``when`` condition holds (a missing argument never matches).
+
+    Args:
+        arguments: Decoded arguments.
+        conditions: Path -> condition.
+
+    Returns:
+        Whether the rule applies.
+    """
+    for path, condition in conditions.items():
+        value = _lookup(arguments, path)
+        if value is _MISSING or check_constraint(path, value, condition) is not None:
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------- #

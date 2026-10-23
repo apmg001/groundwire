@@ -373,6 +373,7 @@ class ToolAction(StrEnum):
 
     ALLOW = "allow"
     BLOCK = "block"
+    REQUIRE_APPROVAL = "require_approval"  # hold the call until a human approves it
 
 
 class ToolViolationHandling(StrEnum):
@@ -419,18 +420,30 @@ class ArgumentConstraint(_StrictModel):
 
 
 class ToolRule(_StrictModel):
-    """One ordered rule; the first rule whose pattern matches a tool decides.
+    """One ordered rule; the first rule that matches a call decides.
+
+    A rule matches when the tool name matches one of ``tools`` *and* every
+    ``when`` condition holds; otherwise evaluation falls through to the next
+    rule (firewall-style). ``when`` makes amount-based tiers possible::
+
+        - {tools: [issue_refund], action: require_approval, when: {amount: {min: 500}}}
+        - {tools: [issue_refund], arguments: {amount: {max: 5000}}}
 
     Attributes:
         tools: Tool-name patterns (shell-style: ``*``, ``?``, ``[abc]``).
-        action: Allow or block matching calls.
-        arguments: Argument name (dotted path for nested values) -> limits.
-            Only checked for allowed calls.
-        name: Label shown in audit logs and response metadata.
+        action: Allow, block, or hold for human approval.
+        when: Argument conditions that select this rule. A condition holds only
+            when the argument is present and satisfies the limits.
+        arguments: Argument name (dotted path for nested values) -> limits that
+            must hold. Checked for allowed calls and for calls that need
+            approval (a call over a hard limit is blocked, never sent to a
+            reviewer).
+        name: Label shown in audit logs, approvals and response metadata.
     """
 
     tools: Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)]
     action: ToolAction = ToolAction.ALLOW
+    when: dict[str, ArgumentConstraint] = Field(default_factory=dict)
     arguments: dict[str, ArgumentConstraint] = Field(default_factory=dict)
     name: Annotated[str, Field(max_length=64)] | None = None
 
@@ -463,6 +476,44 @@ class ToolPolicyConfig(_StrictModel):
     max_tool_rounds: Annotated[int, Field(ge=1, le=1000)] = 25
     validate_arguments: bool = True
     reject_unknown_tools: bool = True
+
+
+class ApprovalStoreType(StrEnum):
+    """Where pending approvals are kept."""
+
+    MEMORY = "memory"  # single replica; lost on restart (agents simply ask again)
+
+
+class ApprovalConfig(_StrictModel):
+    """Human-in-the-loop approval for tool calls (rules with ``action: require_approval``).
+
+    An approval is permission for one *exact* call (same tool, same arguments,
+    same ``user``), used at most once.
+
+    Attributes:
+        enabled: Allow rules to hold calls for approval. Rules that require
+            approval are a configuration error when this is off.
+        store: Storage backend.
+        ttl_s: How long a request waits for a decision before it expires.
+        grant_ttl_s: How long an approved call stays usable before it expires.
+        retention_s: How long decided records stay visible for audit before
+            they are purged from the store.
+        max_records: Capacity of the store (all statuses).
+        max_pending_per_scope: Pending requests one ``user`` may have open at
+            once, so a looping agent cannot flood reviewers.
+        reviewer_token_env: Environment variable holding the reviewer API token.
+            When unset, the reviewer endpoints are disabled (fail closed).
+    """
+
+    enabled: bool = True
+    store: ApprovalStoreType = ApprovalStoreType.MEMORY
+    ttl_s: Annotated[float, Field(ge=10, le=7 * 24 * 3600)] = 900.0
+    grant_ttl_s: Annotated[float, Field(ge=10, le=7 * 24 * 3600)] = 600.0
+    retention_s: Annotated[float, Field(ge=60, le=90 * 24 * 3600)] = 86_400.0
+    max_records: Annotated[int, Field(ge=10, le=1_000_000)] = 10_000
+    max_pending_per_scope: Annotated[int, Field(ge=1, le=10_000)] = 20
+    reviewer_token_env: Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")] = (
+        "GROUNDWIRE_APPROVER_TOKEN")  # noqa: S105 - name of an env var, not a secret
 
 
 class AnswerCheckAction(StrEnum):
@@ -557,6 +608,7 @@ class GatewayConfig(_StrictModel):
             cascade via the ``model`` field, like a route.
         tool_policy: Guardrails for tool calls made by agents.
         answer_check: Fact-check of agents' final answers against tool results.
+        approvals: Human-in-the-loop approval for held tool calls.
     """
 
     providers: Annotated[list[ProviderConfig], Field(min_length=1)]
@@ -571,6 +623,7 @@ class GatewayConfig(_StrictModel):
     cascades: dict[str, CascadeConfig] = Field(default_factory=dict)
     tool_policy: ToolPolicyConfig = ToolPolicyConfig()
     answer_check: AnswerCheckConfig = AnswerCheckConfig()
+    approvals: ApprovalConfig = ApprovalConfig()
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:
@@ -611,6 +664,15 @@ class GatewayConfig(_StrictModel):
         if self.default_route not in self.routes and self.default_route not in self.cascades:
             raise ValueError(f"default_route '{self.default_route}' is not defined in routes "
                              "or cascades")
+
+        policy = self.tool_policy
+        needs_approval = [rule.name or ",".join(rule.tools) for rule in policy.rules
+                          if rule.action is ToolAction.REQUIRE_APPROVAL]
+        if policy.default_action is ToolAction.REQUIRE_APPROVAL:
+            needs_approval.append("default_action")
+        if needs_approval and not self.approvals.enabled:
+            raise ValueError(f"tool rules {needs_approval} require approval, but "
+                             "approvals.enabled is false")
         return self
 
     def enabled_providers(self) -> list[ProviderConfig]:
