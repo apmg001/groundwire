@@ -18,7 +18,8 @@ from groundwire.agents.gate import ToolGate
 from groundwire.agents.policy import ToolPolicy
 from groundwire.approvals import ApprovalService, build_approval_service
 from groundwire.cache import ResponseCache, build_cache
-from groundwire.core.config import ApprovalConfig, GatewayConfig
+from groundwire.cache.embeddings import TransformersEmbedder
+from groundwire.core.config import ApprovalConfig, EvidenceRetrieverType, GatewayConfig
 from groundwire.core.errors import ConfigurationError
 from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
 from groundwire.observability.activity import ActivityLog
@@ -115,7 +116,7 @@ def build_container(
     # until their first request, so half-built providers hold no resources.
     metrics = GatewayMetrics()
     router = Router(config, built_providers, metrics=metrics)
-    grounding = verifier or build_verifier(config.grounding)
+    grounding = verifier or build_verifier(config.grounding, encoder=_evidence_encoder(config))
     guard = safety or SafetyGuard(config.safety, metrics=metrics)
     response_cache = cache or build_cache(config.cache, metrics=metrics)
     cascade = CascadeRunner(router, grounding, metrics=metrics)
@@ -136,6 +137,22 @@ def build_container(
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
                      chat=chat, approvals=approvals, reviewer_token=reviewer_token,
                      admission=admission, activity=activity, dashboard=dashboard)
+
+
+def _evidence_encoder(config: GatewayConfig) -> TransformersEmbedder | None:
+    """Sentence encoder for hybrid evidence retrieval (``None`` for BM25).
+
+    Built here, in the composition root, so the grounding package depends only
+    on its own ``TextEncoder`` protocol, not on the cache package.
+
+    Raises:
+        ConfigurationError: If hybrid retrieval is configured but the model
+            or the ``nli`` extra is unavailable.
+    """
+    evidence = config.grounding.evidence
+    if evidence.retriever is not EvidenceRetrieverType.HYBRID:
+        return None
+    return TransformersEmbedder.load(evidence.embedding_model)
 
 
 def _reviewer_token(config: ApprovalConfig) -> SecretStr | None:

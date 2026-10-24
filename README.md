@@ -460,6 +460,90 @@ See `python -m groundwire.evals --help` for sampling, label policy and threshold
 
 ---
 
+## Long documents: finding the evidence
+
+A user uploads an 80-page policy and asks a question; the answer is on page 60. The verifier
+has to check the model's answer against page 60, without knowing in advance where it is.
+
+**How it works (per request, in memory, nothing stored):**
+
+1. **Chunk** every document: sentence-aligned (a sentence is never cut), about 600 characters,
+   with **one sentence of overlap** so a fact on a boundary appears whole in one chunk, and the
+   **section heading** attached to each chunk ("Late Payment Fee. It is charged after 30 days.")
+   so a chunk that says "it" still matches. Each chunk records its document, so a client that
+   sends one context entry per page gets the page back in `claims[].document`.
+2. **Search with the answer, not the question.** Each claim is the query: BM25 over content
+   words, plus every number as its own heavily weighted term, because an exact `#500` match is
+   the strongest evidence there is. Optional `hybrid` mode re-ranks BM25's candidates with a
+   sentence encoder (reciprocal rank fusion) to catch paraphrases.
+3. **Score each hit as its own window** (the hit plus the chunk before and after it, same
+   document) and keep the best. Windows are not merged on purpose: in the first version they
+   were, and a test caught a claim saying "after **15** days" passing because an unrelated
+   "Clause **15**" sat in the merged text.
+4. **Token scorer:** a context that fits its 4K-token window is passed whole, exactly as
+   benchmarked (76.1% F1 unchanged). A longer one is reduced to every claim's evidence, each
+   claim getting its best chunk before any claim gets a second.
+
+A claim that even its best evidence doesn't support is a hallucination. Short contexts (up to
+64 chunks) are still scored exhaustively, so the RAGTruth results above are unchanged
+(re-run after this change: 64.4% F1, ROC-AUC 0.782).
+
+**Before this, the verifier silently checked only the first 256 passages (~150k characters of
+one document, less with many small ones) and ignored the rest.** A correct answer supported by
+page 60 was marked as a hallucination.
+
+### Benchmark: RAGTruth needle in a haystack
+
+`make bench-longdoc` hides each RAGTruth answer's real source (the document its human label
+refers to) among other RAGTruth documents until the context is long, at the start, middle or
+end in turn. Labels stay valid: the answer was written from that source, and the filler comes
+from unrelated sources. Thresholds are tuned per strategy on *train* haystacks and reported
+on *test* (lexical scorer; `legacy` is the previous algorithm, reproduced exactly).
+
+| Context | Strategy | F1 | ROC-AUC | Good answers blocked | Evidence from the true source | Latency p50 |
+|---|---|---|---|---|---|---|
+| short (ceiling) | original context | 61.1% | 0.764 | 43.6% | 100% | 3 ms |
+| ~60k chars (~20 pages) | legacy | 56.7% | 0.632 | 59.9% | 57.8% | 49 ms |
+| ~60k chars (~20 pages) | **retrieval** | **62.5%** | **0.762** | **34.9%** | **88.0%** | **23 ms** |
+| ~300k chars (~100 pages) | legacy | 53.6% | 0.549 | 80.6% | 29.3% | 50 ms |
+| ~300k chars (~100 pages) | **retrieval** | **66.1%** | **0.783** | **32.6%** | **84.4%** | 106 ms |
+
+900 test answers at 60k (600 train for thresholds); 300 at 300k (300 train). *Evidence from
+the true source*: for grounded answers, the share of claims whose best evidence came from the
+document the answer was written from.
+
+**What the numbers say:**
+
+- **On long documents the old verifier was close to guessing** (ROC-AUC 0.549 at 100 pages)
+  and blocked 4 in 5 correct answers. With retrieval, long documents score as well as short
+  ones.
+- **Position no longer matters.** Legacy ROC-AUC with the source at the end of a 20-page
+  context: 0.419, worse than random. Retrieval: 0.73-0.82 at start, middle and end.
+- **It is also faster at 20 pages** (23 vs 49 ms): each claim is scored against three windows
+  instead of hundreds of passages.
+- **Limits:** one in eight grounded claims still draws its best evidence from a filler document
+  (BM25 matched shared words); the lexical scorer's ceiling (0.76-0.78) is the real limit here.
+  Not measured yet: the token scorer on long contexts (needs a laptop with the model:
+  `python -m groundwire.evals.longdoc --scorer token`) and `hybrid` retrieval.
+
+```yaml
+grounding:
+  evidence:
+    retriever: bm25          # bm25 | hybrid (adds MiniLM re-ranking; make install-nli)
+    chunk_chars: 600
+    overlap_sentences: 1
+    attach_headings: true
+    top_k: 3                 # windows scored per claim
+    neighbours: 1            # chunks on each side of a hit
+    all_pairs_max_chunks: 64 # shorter contexts are scored exhaustively
+    max_chunks: 20000        # hard cap per request (reported as truncated)
+```
+
+Indexing cost, measured: a 2.2-million-character document (~700 pages) chunks in ~0.1 s and
+indexes in ~0.6 s (pure Python); each claim's search takes ~9 ms.
+
+---
+
 ## Cascade routing: cheap model first, strong model only when needed
 
 Strong models are accurate but expensive; cheap ones are cheap but make more things up. A
@@ -982,14 +1066,16 @@ src/groundwire/
   services/       ChatService (safety, cache, deadline, grounding policy), DashboardService
   routing/        Router (fallback chains, failover, streaming handoff), CascadeRunner
   resilience/     RetryPolicy, CircuitBreaker, admission control (lag probe, adaptive limit)
-  guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
+  guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier,
+                  evidence/ (chunking, BM25 + hybrid retrieval, evidence selection)
   safety/         prompt-injection detectors, PII redaction/restoration, SafetyGuard
   cache/          cache keys, embeddings, store port + LRU/TTL adapter, single-flight, policy
   agents/         tool policy, ToolGate (policy + approvals), schema checks, answer check
   approvals/      human approval: domain model, store port + in-memory adapter, service
   evals/          RAGTruth benchmark (loader, metrics, runner, report, CLI);
                   QQP loader + cachebench/ (semantic-cache benchmark);
-                  cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
+                  cascade/ (cheap-first routing simulation); gate/ (CI quality gates);
+                  longdoc/ (long-document needle-in-a-haystack benchmark)
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
   observability/  Prometheus metrics, recent-activity log
   core/           config, errors, logging, request context
@@ -1026,7 +1112,9 @@ loadtest/         fake model server, Locust traffic, profiles, runner + report
 - [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
 - [x] Load, stress, spike, chaos and soak tests; adaptive load shedding; fail over on timeout
 - [ ] Time-to-first-token timeout or hedged requests (a hung provider still costs one timeout)
-- [x] Live dashboard and one-click public demo (Hugging Face Spaces)
+- [x] Live dashboard and one-click public demo
+- [x] Long documents: per-claim evidence retrieval (BM25 + optional hybrid), overlap and heading-aware chunking, needle-in-a-haystack benchmark
+- [ ] Token scorer and hybrid retrieval measured on long documents
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 

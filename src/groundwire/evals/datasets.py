@@ -156,6 +156,13 @@ def ragtruth_label(labels: Sequence[dict[str, Any]], policy: LabelPolicy) -> boo
 # --------------------------------------------------------------------------- #
 
 
+def _question(source_info: Any) -> str | None:
+    """The user question of a QA source (``None`` for other tasks)."""
+    if isinstance(source_info, dict) and isinstance(source_info.get("question"), str):
+        return str(source_info["question"])
+    return None
+
+
 def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     """Yield JSON objects from a JSONL file.
 
@@ -257,7 +264,8 @@ def load_ragtruth(
             response=str(record.get("response", "")),
             is_hallucinated=ragtruth_label(labels, label_policy),
             meta={"model": record.get("model"), "source_id": str(record.get("source_id")),
-                  "span_types": sorted({str(s.get("label_type")) for s in labels})},
+                  "span_types": sorted({str(s.get("label_type")) for s in labels}),
+                  "question": _question(source.get("source_info"))},
             prompt=str(source["prompt"]) if source.get("prompt") else None,
         ))
 

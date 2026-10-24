@@ -78,6 +78,28 @@ def content_tokens(text: str) -> set[str]:
     }
 
 
+NUMBER_TERM_PREFIX = "#"
+
+
+def retrieval_terms(text: str) -> list[str]:
+    """Terms for keyword retrieval (BM25): content words plus whole numbers.
+
+    Unlike :func:`content_tokens` this keeps repeats (term frequency matters
+    to BM25) and adds every normalised number or clock time as one term
+    prefixed with :data:`NUMBER_TERM_PREFIX` ("1,200" -> ``"#1200"``), so a
+    claim's figures can be matched exactly and weighted on their own.
+
+    Args:
+        text: Input text.
+
+    Returns:
+        Terms in order of appearance (with repeats).
+    """
+    words = [_stem(tok) for tok in _WORD.findall(text.lower())
+             if tok not in STOPWORDS and len(tok) > 2 and not tok.isdigit()]
+    return words + [NUMBER_TERM_PREFIX + n for n in sorted(numbers(text))]
+
+
 def _time_token(match: re.Match[str]) -> str | None:
     """Convert a clock-time match to a canonical ``"tHH:MM"`` token.
 

@@ -1,6 +1,6 @@
 .PHONY: install install-nli lint typecheck test cov check run docker-build up down chaos demo \
         bench-data bench bench-nli bench-hybrid bench-token bench-cache-data bench-cache \
-        gate gate-full gate-calibrate bench-cascade bench-cascade-token \
+        gate gate-full gate-calibrate bench-cascade bench-cascade-token bench-longdoc \
         agent agent-risky agent-seq agent-risky-seq agent-liar \
         agent-approval agent-approval-manual approvals approve reject \
         install-load loadtest-load loadtest-stress loadtest-spike loadtest-chaos loadtest-soak \
@@ -61,6 +61,9 @@ bench-nli: bench-data  ## NLI scorer on 100 test responses per task (needs make 
 
 bench-hybrid: bench-data  ## Numeric gate + NLI (needs make install-nli)
 	python -m groundwire.evals --scorer hybrid --per-task 100 --dev-per-task 50 --evidence-passages 3
+
+bench-longdoc: bench-data ## Long documents: real source hidden in ~20 pages of RAGTruth text, old vs new
+	python -m groundwire.evals.longdoc --per-task 300 --dev-per-task 200
 
 bench-token: bench-data  ## LettuceDetect token classifier, full test set, native 0.5 threshold
 	python -m groundwire.evals --scorer token --per-task 0 --dev-per-task 0 \
