@@ -102,8 +102,9 @@ class DashboardService:
             "failovers": sum(m.totals_by(m.failovers, "route").values()),
             "safety": {"pii_redacted": sum(m.totals_by(m.pii_redactions, "type").values()),
                        "pii_by_type": m.totals_by(m.pii_redactions, "type"),
-                       "injection_blocked": injection.get("block", 0.0),
-                       "injection_flagged": injection.get("flag", 0.0)},
+                       # labels as recorded by SafetyGuard._apply_injection_policy
+                       "injection_blocked": injection.get("blocked", 0.0),
+                       "injection_flagged": injection.get("flagged", 0.0)},
             "grounding": m.totals_by(m.grounding, "verdict"),
             "answer_checks": m.totals_by(m.answer_checks, "verdict"),
             "tools": m.totals_by(m.tool_calls, "decision"),

@@ -105,13 +105,20 @@ docker compose up --build     # gateway :8000, Prometheus :9090
 
 ## Live dashboard and public demo
 
-![Groundwire dashboard: live totals, scenario buttons and the human approval queue](docs/dashboard.png)
+![Groundwire web app: an AI agent's $1,200 refund paused for human approval, with Approve and Reject buttons in the chat](docs/dashboard.png)
 
-The gateway serves a live dashboard at **`/dashboard`** (the root URL redirects there):
-request totals, latency, cache hit rate, failovers, PII redacted, injections blocked,
-hallucinations caught, tool calls blocked, the approval queue, load, provider health and
-a live feed of recent requests. It is one self-contained HTML page served by the gateway
-(no build step, no CDN), reading two JSON endpoints:
+The gateway serves a web app at **`/dashboard`** (the root URL redirects there), written
+for people who have never heard of an LLM gateway:
+
+| Page | What it shows |
+|---|---|
+| **Playground** | A chat. Under every reply, plain-English notes say what Groundwire did ("Your phone number was hidden from the AI", "Fact-check failed: 100% of this answer is not in your document"). Agent runs appear as a step-by-step timeline, and a held action has Approve/Reject buttons right in the conversation. Raw metadata is one click away under "Technical details". |
+| **Approvals** | Actions waiting for a person, plus recent decisions. A badge in the sidebar counts what is waiting. |
+| **Activity** | Every request, live: what was asked for, which model answered, and what the gateway did. |
+| **Overview** | What Groundwire is, how a request flows through it, live totals, provider health, and measured benchmark results. |
+
+It is one self-contained HTML file served by the gateway (no build step, no CDN), with
+light and dark themes and a phone layout, reading two JSON endpoints:
 
 | Endpoint | Returns |
 |---|---|
@@ -130,7 +137,7 @@ make demo-live                 # http://localhost:7860
 GROQ_API_KEY=gsk_... make demo-live   # real answers from Llama 3.1 8B on Groq
 ```
 
-`config/demo.yaml` adds a **Try it** panel with eight scenarios: PII redaction, prompt
+`config/demo.yaml` gives the Playground eight one-click scenarios: PII redaction, prompt
 injection, fact-checking against a document, a failover drill, and four agent runs (an
 allowed refund, a blocked $100,000 refund, a $1,200 refund that waits for *you* to
 approve it, and an agent that refunds $1 but claims $49.99). Agent scenarios use scripted
