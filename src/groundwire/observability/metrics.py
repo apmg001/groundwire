@@ -174,6 +174,33 @@ class GatewayMetrics:
         if completion:
             self.tokens.labels(provider=provider, kind="completion").inc(completion)
 
+    @staticmethod
+    def totals_by(metric: Counter, label: str) -> dict[str, float]:
+        """Sum a counter's values grouped by one label (for dashboards).
+
+        Args:
+            metric: A counter from this registry.
+            label: Label to group by (e.g. ``"status"``).
+
+        Returns:
+            Label value -> total count.
+        """
+        totals: dict[str, float] = {}
+        for family in metric.collect():
+            for sample in family.samples:
+                if sample.name.endswith("_total"):
+                    key = sample.labels.get(label, "")
+                    totals[key] = totals.get(key, 0.0) + sample.value
+        return totals
+
+    @staticmethod
+    def gauge_value(metric: Gauge) -> float:
+        """Current value of an unlabelled gauge (0 if it was never set)."""
+        for family in metric.collect():
+            for sample in family.samples:
+                return float(sample.value)
+        return 0.0
+
     def render(self) -> bytes:
         """Return metrics in the Prometheus text exposition format."""
         return generate_latest(self.registry)

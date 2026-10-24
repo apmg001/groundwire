@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -24,6 +25,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from groundwire import __version__
 from groundwire.container import Container
+from groundwire.core.context import get_request_id
+from groundwire.core.errors import GroundwireError
 from groundwire.domain.models import ChatCompletionRequest, ChatCompletionResponse
 from groundwire.services.chat import StreamSession
 
@@ -66,8 +69,23 @@ async def chat_completions(
     Returns:
         JSON response, or an SSE stream when ``stream`` is true.
     """
+    started = time.perf_counter()
+    route = body.model or container.config.default_route
+    try:
+        if body.stream:
+            session = await container.chat.stream(body)
+        else:
+            result: ChatCompletionResponse = await container.chat.complete(body)
+    except GroundwireError as exc:
+        _record(container, route=route, provider="", status=exc.http_status, started=started,
+                stream=body.stream, error_code=exc.code)
+        raise
+
     if body.stream:
-        session = await container.chat.stream(body)
+        # Recorded when the stream starts (time to first byte): later chunks are the
+        # model's pace, and in-band stream errors are counted in the metrics.
+        _record(container, route=route, provider=session.provider, status=200,
+                started=started, stream=True)
         return StreamingResponse(
             _sse(session),
             media_type="text/event-stream",
@@ -78,11 +96,41 @@ async def chat_completions(
             },
         )
 
-    result: ChatCompletionResponse = await container.chat.complete(body)
+    _record(container, route=str(result.groundwire.get("route", route)),
+            provider=str(result.groundwire.get("provider", "")), status=200, started=started,
+            metadata=result.groundwire)
     return JSONResponse(
         content=result.model_dump(exclude_none=True),
         headers={PROVIDER_HEADER: str(result.groundwire.get("provider", ""))},
     )
+
+
+def _record(container: Container, *, route: str, provider: str, status: int, started: float,
+            stream: bool = False, error_code: str = "",
+            metadata: Mapping[str, Any] | None = None) -> None:
+    """Add one request to the dashboard's activity log (no-op when it is off).
+
+    Never raises: a dashboard problem must not turn a served request into an error.
+
+    Args:
+        container: App container.
+        route: Route alias.
+        provider: Provider that answered ("" if none).
+        status: HTTP status returned.
+        started: ``perf_counter`` at request start.
+        stream: Streamed response.
+        error_code: Error code for failures.
+        metadata: The response's ``groundwire`` metadata.
+    """
+    if container.activity is None:
+        return
+    try:
+        container.activity.record(request_id=get_request_id(), route=route, provider=provider,
+                                  status=status, stream=stream, error_code=error_code,
+                                  latency_ms=(time.perf_counter() - started) * 1000,
+                                  metadata=metadata)
+    except Exception:  # defensive: see docstring
+        logger.warning("could not record dashboard activity", exc_info=True)
 
 
 async def _sse(session: StreamSession) -> AsyncIterator[bytes]:

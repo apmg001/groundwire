@@ -24,6 +24,7 @@ from fastapi import FastAPI
 
 from groundwire import __version__
 from groundwire.api.approvals import router as approvals_router
+from groundwire.api.dashboard import router as dashboard_router
 from groundwire.api.errors import register_exception_handlers
 from groundwire.api.middleware import (
     AdmissionMiddleware,
@@ -94,6 +95,7 @@ def create_app(
                   docs_url="/docs", redoc_url=None)
     app.include_router(router)
     app.include_router(approvals_router)
+    app.include_router(dashboard_router)
     register_exception_handlers(app)
     # Added innermost first. Request context wraps everything so even 413s and
     # 503s get a request ID and an access-log line; admission runs before the

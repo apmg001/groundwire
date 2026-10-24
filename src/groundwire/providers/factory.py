@@ -7,6 +7,7 @@ adapter class, so adding a vendor touches exactly one ``match`` arm here.
 from __future__ import annotations
 
 import logging
+import os
 from typing import assert_never
 
 from groundwire.core.config import GatewayConfig, ProviderConfig, ProviderType, resolve_api_key
@@ -71,11 +72,20 @@ def build_providers(config: GatewayConfig) -> dict[str, Provider]:
     """
     providers: dict[str, Provider] = {}
     for provider_config in config.enabled_providers():
+        if _key_missing(provider_config) and provider_config.skip_if_no_key:
+            logger.warning("provider skipped: API key not set", extra={
+                "provider": provider_config.name, "env": provider_config.api_key_env})
+            continue
         providers[provider_config.name] = build_provider(provider_config)
         logger.info("provider ready", extra={"provider": provider_config.name,
                                              "type": provider_config.type.value,
                                              "model": provider_config.model})
     return providers
+
+
+def _key_missing(config: ProviderConfig) -> bool:
+    """True if the provider names an API-key variable that is unset or empty."""
+    return bool(config.api_key_env) and not os.environ.get(config.api_key_env or "", "").strip()
 
 
 async def close_providers(providers: dict[str, Provider]) -> None:

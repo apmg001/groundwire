@@ -21,6 +21,7 @@ from groundwire.cache import ResponseCache, build_cache
 from groundwire.core.config import ApprovalConfig, GatewayConfig
 from groundwire.core.errors import ConfigurationError
 from groundwire.guardrails.grounding import GroundingVerifier, build_verifier
+from groundwire.observability.activity import ActivityLog
 from groundwire.observability.metrics import GatewayMetrics
 from groundwire.providers.base import Provider
 from groundwire.providers.factory import build_providers, close_providers
@@ -29,6 +30,7 @@ from groundwire.routing.cascade import CascadeRunner
 from groundwire.routing.router import Router
 from groundwire.safety.guard import SafetyGuard
 from groundwire.services.chat import ChatService
+from groundwire.services.dashboard import DashboardService
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,8 @@ class Container:
         approvals: Human-approval service (``None`` when disabled).
         reviewer_token: Token for the reviewer API (``None``: reviewer API off).
         admission: Load-shedding controller (``None``: never shed).
+        activity: Recent-request log for the dashboard (``None``: not recorded).
+        dashboard: Dashboard read model (``None``: dashboard off).
     """
 
     config: GatewayConfig
@@ -64,6 +68,8 @@ class Container:
     approvals: ApprovalService | None = None
     reviewer_token: SecretStr | None = None
     admission: AdmissionController | None = None
+    activity: ActivityLog | None = None
+    dashboard: DashboardService | None = None
 
     def start(self) -> None:
         """Start background tasks (the event-loop lag probe). Needs a running loop."""
@@ -118,11 +124,18 @@ def build_container(
     chat = ChatService(router, grounding, metrics, request_timeout_s=config.request_timeout_s,
                        safety=guard, cache=response_cache, cascade=cascade, tool_gate=gate,
                        answer_checker=AnswerChecker(config.answer_check))
+    reviewer_token = _reviewer_token(config.approvals)
+    admission = AdmissionController(config.admission, metrics=metrics)
+    activity: ActivityLog | None = None
+    dashboard: DashboardService | None = None
+    if config.dashboard.enabled:
+        activity = ActivityLog(config.dashboard.activity_capacity)
+        dashboard = DashboardService(config, metrics=metrics, activity=activity, router=router,
+                                     admission=admission, reviewer_token=reviewer_token)
     return Container(config=config, providers=built_providers, metrics=metrics,
                      router=router, verifier=grounding, safety=guard, cache=response_cache,
-                     chat=chat, approvals=approvals,
-                     reviewer_token=_reviewer_token(config.approvals),
-                     admission=AdmissionController(config.admission, metrics=metrics))
+                     chat=chat, approvals=approvals, reviewer_token=reviewer_token,
+                     admission=admission, activity=activity, dashboard=dashboard)
 
 
 def _reviewer_token(config: ApprovalConfig) -> SecretStr | None:

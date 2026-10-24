@@ -3,7 +3,8 @@
         gate gate-full gate-calibrate bench-cascade bench-cascade-token \
         agent agent-risky agent-seq agent-risky-seq agent-liar \
         agent-approval agent-approval-manual approvals approve reject \
-        install-load loadtest-load loadtest-stress loadtest-spike loadtest-chaos loadtest-soak
+        install-load loadtest-load loadtest-stress loadtest-spike loadtest-chaos loadtest-soak \
+        demo-live
 
 # Reviewer token for the approval API (make run and the approval targets share it).
 # Development default only: set your own secret in any shared or deployed setup.
@@ -144,3 +145,12 @@ loadtest-chaos:   ## 100 users while the primary model fails, then hangs: failov
 
 loadtest-soak:    ## 100 users for 10 minutes: memory must stay flat
 	python -m loadtest.run soak --users 100 --duration 600
+
+# --------------------------------------------------------------------------- #
+# Live demo: the public-demo config with the dashboard, on http://localhost:7860
+# Set GROQ_API_KEY for real answers; without it a backup model answers.
+# --------------------------------------------------------------------------- #
+
+demo-live:        ## Run the public demo locally: open http://localhost:7860
+	GROUNDWIRE_CONFIG_PATH=config/demo.yaml GROUNDWIRE_PORT=7860 GROUNDWIRE_LOG_JSON=false \
+	GROUNDWIRE_APPROVER_TOKEN=public-demo-reviewer-token groundwire

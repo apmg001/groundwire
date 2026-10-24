@@ -1,0 +1,159 @@
+# --------------------------------------------------------------------------- #
+# Public demo (Hugging Face Space, make demo-live).
+#
+# - "default" answers with a real model (Groq, free tier) and falls back to a
+#   built-in mock when GROQ_API_KEY is unset or Groq rate-limits the demo, so
+#   the demo never goes down and visitors can watch failover happen.
+# - Agent scenarios use scripted mock models: same outcome every time, and no
+#   tool call ever touches anything real.
+# - dashboard.public_demo hands the reviewer token to the page so visitors can
+#   approve or reject held calls. Never use this setting where tools are real.
+# --------------------------------------------------------------------------- #
+
+request_timeout_s: 30
+
+retry:
+  max_attempts: 2
+  base_delay_s: 0.2
+  max_delay_s: 1.0
+
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout_s: 30
+  half_open_max_calls: 1
+
+grounding:
+  scorer: lexical
+  on_error: fail_open
+
+safety:
+  injection:
+    action: block
+    detector: heuristic
+    threshold: 0.7
+  pii:
+    enabled: true
+    types: [email, phone, card, aadhaar, pan, ip_address]
+    restore_output: true
+
+cache:
+  enabled: true
+  semantic: false
+  ttl_s: 3600
+  max_entries: 5000
+  coalesce: true
+  partition_by_user: true      # visitors never see each other's cached answers
+
+providers:
+  - name: groq
+    type: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.1-8b-instant
+    api_key_env: GROQ_API_KEY
+    skip_if_no_key: true       # no key: start anyway and serve from the fallback
+    timeout_s: 20
+    max_connections: 20
+
+  - name: fallback-mock
+    type: mock
+    model: mock-fallback
+    mock:
+      response_text: >-
+        (Backup model) The live AI model is unavailable or rate-limited right now, so the
+        gateway failed over to this backup. Your request was still screened, redacted and
+        logged exactly as usual.
+      latency_s: 0.05
+
+  # Failover drill: the primary fails half its calls.
+  - name: mock-flaky
+    type: mock
+    model: mock-1
+    mock:
+      response_text: "All systems normal. Invoice INV-1042 totals 1,200 USD."
+      latency_s: 0.05
+      failure_rate: 0.5
+  - name: mock-stable
+    type: mock
+    model: mock-1
+    mock:
+      response_text: "All systems normal. Invoice INV-1042 totals 1,200 USD."
+      latency_s: 0.02
+
+  # Agent scenarios (scripted models that request the issue_refund tool).
+  - name: mock-agent
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund of $49.99 for order 7781 has been issued."
+      latency_s: 0.02
+      tool_call: {name: issue_refund, arguments: {order_id: 7781, amount: 49.99}}
+  - name: mock-agent-greedy
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund for order 7781 has been issued."
+      latency_s: 0.02
+      tool_call: {name: issue_refund, arguments: {order_id: 7781, amount: 100000}}
+  - name: mock-agent-approval
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "Your refund of $1200 for order 4417 has been issued."
+      latency_s: 0.02
+      tool_call: {name: issue_refund, arguments: {order_id: 4417, amount: 1200}}
+  - name: mock-agent-liar
+    type: mock
+    model: mock-agent
+    mock:
+      response_text: "I have refunded $49.99 for order 7781."
+      latency_s: 0.02
+      tool_call: {name: issue_refund, arguments: {order_id: 7781, amount: 1}}
+
+routes:
+  default: [groq, fallback-mock]
+  demo: [mock-flaky, mock-stable]
+  agent-demo: [mock-agent]
+  agent-demo-risky: [mock-agent-greedy]
+  agent-demo-approval: [mock-agent-approval]
+  agent-demo-liar: [mock-agent-liar]
+
+tool_policy:
+  enabled: true
+  on_violation: drop
+  injection_lockdown: true
+  max_tool_rounds: 10
+  validate_arguments: true
+  reject_unknown_tools: true
+  default_action: allow
+  rules:
+    - name: refund-approval
+      tools: [issue_refund]
+      action: require_approval
+      when:
+        amount: {min: 500}
+      arguments:
+        amount: {max: 5000}
+    - name: refund-cap
+      tools: [issue_refund]
+      arguments:
+        amount: {max: 5000}
+
+approvals:
+  enabled: true
+  store: memory                # one process: the Space runs a single worker
+  ttl_s: 900
+  grant_ttl_s: 600
+  retention_s: 3600
+  max_records: 2000
+  max_pending_per_scope: 5     # each visitor has their own scope (the page sends `user`)
+  reviewer_token_env: GROUNDWIRE_APPROVER_TOKEN
+
+answer_check:
+  enabled: true
+  action: flag
+
+dashboard:
+  enabled: true
+  public_demo: true
+
+default_route: default

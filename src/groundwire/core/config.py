@@ -139,6 +139,10 @@ class ProviderConfig(_StrictModel):
         timeout_s: Per-call timeout (connect + read), in seconds.
         max_connections: Connection-pool size for this provider.
         enabled: Disabled providers are skipped and need no API key.
+        skip_if_no_key: Start without this provider (warning logged) when its
+            ``api_key_env`` variable is unset, instead of refusing to start.
+            For optional providers in front of a fallback (a public demo
+            whose cloud key may be absent); routes must keep another provider.
         default_max_tokens: Used when the client sends no ``max_tokens``
             (Anthropic requires the field).
         mock: Behaviour for ``mock`` providers.
@@ -152,6 +156,7 @@ class ProviderConfig(_StrictModel):
     timeout_s: Annotated[float, Field(gt=0, le=600)] = 60.0
     max_connections: Annotated[int, Field(ge=1, le=1000)] = 50
     enabled: bool = True
+    skip_if_no_key: bool = False
     default_max_tokens: Annotated[int, Field(ge=1, le=200_000)] = 1024
     mock: MockBehaviour = MockBehaviour()
 
@@ -636,6 +641,26 @@ class AdmissionConfig(_StrictModel):
         return self
 
 
+class DashboardConfig(_StrictModel):
+    """Live dashboard served by the gateway at ``/dashboard``.
+
+    The dashboard shows counts, verdicts and recent request summaries, never
+    prompt or answer text, so it is safe to expose read-only.
+
+    Attributes:
+        enabled: Serve ``/dashboard`` and its JSON API.
+        activity_capacity: Recent requests kept for the activity feed.
+        public_demo: Demo deployments only. Shows scenario buttons and hands
+            the reviewer token to the page so any visitor can approve or
+            reject held calls. Never enable this where tool calls do real
+            things: it makes every visitor a reviewer.
+    """
+
+    enabled: bool = True
+    activity_capacity: Annotated[int, Field(ge=10, le=10_000)] = 200
+    public_demo: bool = False
+
+
 class GatewayConfig(_StrictModel):
     """Root of the YAML gateway configuration.
 
@@ -657,6 +682,7 @@ class GatewayConfig(_StrictModel):
         answer_check: Fact-check of agents' final answers against tool results.
         approvals: Human-in-the-loop approval for held tool calls.
         admission: Load shedding when the gateway is overloaded.
+        dashboard: Live dashboard at ``/dashboard``.
     """
 
     providers: Annotated[list[ProviderConfig], Field(min_length=1)]
@@ -673,6 +699,7 @@ class GatewayConfig(_StrictModel):
     answer_check: AnswerCheckConfig = AnswerCheckConfig()
     approvals: ApprovalConfig = ApprovalConfig()
     admission: AdmissionConfig = AdmissionConfig()
+    dashboard: DashboardConfig = DashboardConfig()
 
     @model_validator(mode="after")
     def _check_references(self) -> Self:

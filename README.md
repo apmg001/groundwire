@@ -17,7 +17,8 @@ OpenAI SDK at it by changing one URL, and every call gets:
   questions are answered without a model call.
 - **Cascade routing**: cheap model first, strong model only when the answer fails the
   fact-check (matched GPT-4's hallucination rate at ~15% of its cost on RAGTruth).
-- **Structured JSON logs** with request IDs, and **Prometheus metrics**.
+- **Structured JSON logs** with request IDs, **Prometheus metrics**, and a **live dashboard**
+  with a one-click public demo ([below](#live-dashboard-and-public-demo)).
 
 Runs fully offline on a laptop CPU. No GPU, no cloud account required.
 
@@ -99,6 +100,64 @@ To add cloud fallbacks, export the key and set `enabled: true` for that provider
 ```bash
 docker compose up --build     # gateway :8000, Prometheus :9090
 ```
+
+---
+
+## Live dashboard and public demo
+
+![Groundwire dashboard: live totals, scenario buttons and the human approval queue](docs/dashboard.png)
+
+The gateway serves a live dashboard at **`/dashboard`** (the root URL redirects there):
+request totals, latency, cache hit rate, failovers, PII redacted, injections blocked,
+hallucinations caught, tool calls blocked, the approval queue, load, provider health and
+a live feed of recent requests. It is one self-contained HTML page served by the gateway
+(no build step, no CDN), reading two JSON endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/dashboard/summary` | Totals and current state, from the Prometheus registry |
+| `GET /v1/dashboard/activity?after=<seq>` | Recent requests, newest first (incremental polling) |
+
+**Privacy:** the activity feed stores verdicts and counts only (route, provider, status,
+latency, PII *types* redacted, tool decisions). Never prompt or answer text, never tool
+arguments, so the dashboard can be shown publicly. A test checks that a redacted email
+never appears in the feed. Turn it off with `dashboard.enabled: false`.
+
+### Run the public demo locally
+
+```bash
+make demo-live                 # http://localhost:7860
+GROQ_API_KEY=gsk_... make demo-live   # real answers from Llama 3.1 8B on Groq
+```
+
+`config/demo.yaml` adds a **Try it** panel with eight scenarios: PII redaction, prompt
+injection, fact-checking against a document, a failover drill, and four agent runs (an
+allowed refund, a blocked $100,000 refund, a $1,200 refund that waits for *you* to
+approve it, and an agent that refunds $1 but claims $49.99). Agent scenarios use scripted
+models and fake tools, so the outcome is the same every time and nothing real happens.
+
+Groq is optional: the provider has `skip_if_no_key: true`, so without `GROQ_API_KEY` the
+gateway starts anyway and a backup model answers. When Groq rate-limits the public demo,
+failover sends visitors to the backup, which is the gateway doing its job in public.
+
+`dashboard.public_demo: true` gives every visitor the reviewer token so they can approve
+held calls. That is only acceptable because the demo's tools are fake: never enable it
+where a tool call does something real.
+
+### Deploy to Hugging Face Spaces (free)
+
+1. Create a Space at [huggingface.co/new-space](https://huggingface.co/new-space):
+   SDK **Docker**, template **Blank**, hardware **CPU basic (free)**.
+2. Upload the two files in `deploy/huggingface/` (`Dockerfile` and `README.md`) to the
+   Space, through the web UI ("Files" → "Add file") or with git.
+3. Optional: in the Space's **Settings → Variables and secrets**, add the secret
+   `GROQ_API_KEY` (free key from [console.groq.com](https://console.groq.com/keys)).
+4. The Space builds and starts on its own. The Dockerfile installs Groundwire from this
+   GitHub repo, so to deploy new code: push to GitHub, then **Settings → Factory rebuild**.
+
+One worker and one replica, as the in-memory approval store requires (see
+[Workers and replicas](#workers-and-replicas)). Free Spaces sleep after a period without
+visitors and wake on the next visit.
 
 ---
 
@@ -903,8 +962,8 @@ look better.
 
 ```
 src/groundwire/
-  api/            routes, ASGI middleware (request ID, body limit), error mapping
-  services/       ChatService: safety, cache, deadline, grounding policy, metrics
+  api/            routes, dashboard (page + JSON API), ASGI middleware, error mapping
+  services/       ChatService (safety, cache, deadline, grounding policy), DashboardService
   routing/        Router (fallback chains, failover, streaming handoff), CascadeRunner
   resilience/     RetryPolicy, CircuitBreaker, admission control (lag probe, adaptive limit)
   guardrails/     text utils, scorers (lexical, NLI, hybrid), token detector, GroundingVerifier
@@ -916,13 +975,14 @@ src/groundwire/
                   QQP loader + cachebench/ (semantic-cache benchmark);
                   cascade/ (cheap-first routing simulation); gate/ (CI quality gates)
   providers/      base port, OpenAI-compatible, Anthropic, mock, factory
-  observability/  Prometheus metrics
+  observability/  Prometheus metrics, recent-activity log
   core/           config, errors, logging, request context
   domain/         OpenAI-compatible models
   container.py    composition root
   main.py         app factory and entrypoint
 tests/            unit + integration (no network needed)
-config/           gateway YAML (local and Docker variants)
+config/           gateway YAML (local, Docker, public demo, load test)
+deploy/           Prometheus config, Hugging Face Space files
 scripts/          chaos demo, agent demo, reviewer CLI
 loadtest/         fake model server, Locust traffic, profiles, runner + report
 ```
@@ -950,6 +1010,7 @@ loadtest/         fake model server, Locust traffic, profiles, runner + report
 - [ ] Agent benchmark (AgentDojo): attack success and task success with and without guardrails
 - [x] Load, stress, spike, chaos and soak tests; adaptive load shedding; fail over on timeout
 - [ ] Time-to-first-token timeout or hedged requests (a hung provider still costs one timeout)
+- [x] Live dashboard and one-click public demo (Hugging Face Spaces)
 - [ ] OpenTelemetry tracing and Grafana dashboard
 - [ ] Helm chart; shared (Redis-backed) breaker state across replicas
 
