@@ -25,8 +25,11 @@ logger = logging.getLogger(__name__)
 async def _groundwire_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, GroundwireError)
     level = logging.ERROR if exc.http_status >= 500 else logging.INFO
+    # The full message (which may quote an upstream response) goes to the logs only;
+    # the client gets exc.public_message via to_payload().
     logger.log(level, "request failed", extra={"error_code": exc.code,
-                                                "status": exc.http_status})
+                                                "status": exc.http_status,
+                                                "detail": exc.message})
     headers = ({"Retry-After": str(exc.retry_after_s)} if isinstance(exc, OverloadedError)
                else None)
     return JSONResponse(status_code=exc.http_status, content=exc.to_payload(), headers=headers)

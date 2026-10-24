@@ -391,7 +391,8 @@ class Router:
                 raise
             breaker.record_failure()
             logger.warning("provider failed, failing over",
-                           extra={"provider": provider.name, "error_code": exc.code})
+                           extra={"provider": provider.name, "error_code": exc.code,
+                                  "detail": exc.message})
             return None
 
         breaker.record_success()

@@ -5,6 +5,12 @@ Each class carries two pieces of metadata the rest of the system relies on:
 
 * ``http_status`` / ``code``: how the API layer renders the error to clients,
   in an OpenAI-compatible ``{"error": {...}}`` envelope.
+* ``public_message``: what clients see. For errors raised by Groundwire it is
+  the message itself; for provider errors it is a fixed, safe sentence per
+  error type, because the raw message embeds the upstream response body
+  (vendor model names, account hints, internal ids). The raw text stays on
+  ``message`` for logs only. Every error body also carries the ``request_id``,
+  so a user can quote it and an operator can find the full detail in the logs.
 * ``retryable`` (provider errors only): whether the resilience layer may retry
   the same provider, and whether the failure should count against that
   provider's circuit breaker.
@@ -18,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+
+from groundwire.core.context import get_request_id
 
 # --------------------------------------------------------------------------- #
 # Base
@@ -39,20 +47,28 @@ class GroundwireError(Exception):
         """Create the error.
 
         Args:
-            message: Human-readable description, safe to show to API clients.
+            message: Full description, for logs (and for clients, unless a
+                subclass overrides :attr:`public_message`).
             details: Optional structured context included in the error body.
+                Must never carry upstream response text.
         """
         super().__init__(message)
         self.message = message
         self.details: dict[str, Any] = details or {}
 
+    @property
+    def public_message(self) -> str:
+        """The message clients see (the full message, unless overridden)."""
+        return self.message
+
     def to_payload(self) -> dict[str, Any]:
-        """Render the error in an OpenAI-compatible envelope.
+        """Render the error in an OpenAI-compatible envelope, safe for clients.
 
         Returns:
-            A JSON-serialisable dict of the form ``{"error": {...}}``.
+            ``{"error": {"message", "type", "code", "request_id", ["details"]}}``.
         """
-        body: dict[str, Any] = {"message": self.message, "type": self.code, "code": self.code}
+        body: dict[str, Any] = {"message": self.public_message, "type": self.code,
+                                "code": self.code, "request_id": get_request_id()}
         if self.details:
             body["details"] = self.details
         return {"error": body}
@@ -103,6 +119,7 @@ class ProviderError(GroundwireError):
     code = "provider_error"
     retryable: bool = False
     failover: bool = True
+    public_text: str = "The AI provider returned an error."
 
     def __init__(
         self,
@@ -127,12 +144,18 @@ class ProviderError(GroundwireError):
         self.upstream_status = upstream_status
         self.retry_after_s = retry_after_s
 
+    @property
+    def public_message(self) -> str:
+        """A fixed sentence per error type; never the upstream response text."""
+        return self.public_text
+
 
 class ProviderTimeoutError(ProviderError):
     """The provider did not respond within its timeout."""
 
     code = "provider_timeout"
     retryable = True
+    public_text = "The AI provider took too long to respond."
 
 
 class ProviderConnectionError(ProviderError):
@@ -140,6 +163,7 @@ class ProviderConnectionError(ProviderError):
 
     code = "provider_unreachable"
     retryable = True
+    public_text = "The AI provider could not be reached."
 
 
 class ProviderRateLimitError(ProviderError):
@@ -147,6 +171,7 @@ class ProviderRateLimitError(ProviderError):
 
     code = "provider_rate_limited"
     retryable = True
+    public_text = "The AI provider is limiting requests right now. Please retry shortly."
 
 
 class ProviderServerError(ProviderError):
@@ -154,6 +179,7 @@ class ProviderServerError(ProviderError):
 
     code = "provider_server_error"
     retryable = True
+    public_text = "The AI provider had an internal error."
 
 
 class ProviderAuthError(ProviderError):
@@ -166,6 +192,7 @@ class ProviderAuthError(ProviderError):
     code = "provider_auth_error"
     retryable = False
     failover = True
+    public_text = "The gateway could not authenticate with the AI provider."
 
 
 class ProviderNotFoundError(ProviderError):
@@ -181,6 +208,7 @@ class ProviderNotFoundError(ProviderError):
     code = "provider_not_found"
     retryable = False
     failover = True
+    public_text = "The AI model configured for this route is not available."
 
 
 class ProviderBadRequestError(ProviderError):
@@ -194,6 +222,8 @@ class ProviderBadRequestError(ProviderError):
     code = "upstream_rejected_request"
     retryable = False
     failover = False
+    public_text = ("The AI provider could not process this request (for example, it may be "
+                   "too long or use an option the model does not support).")
 
 
 class ProviderResponseError(ProviderError):
@@ -201,6 +231,7 @@ class ProviderResponseError(ProviderError):
 
     code = "provider_bad_response"
     retryable = True
+    public_text = "The AI provider sent an invalid response."
 
 
 # --------------------------------------------------------------------------- #
@@ -232,7 +263,8 @@ class AttemptRecord:
         provider: Provider name.
         outcome: ``"success"``, ``"error"`` or ``"skipped_circuit_open"``.
         error_code: Error code when the attempt failed.
-        message: Error message when the attempt failed.
+        message: Full error text when the attempt failed. Internal: logged,
+            never serialised for clients (it may embed upstream responses).
     """
 
     provider: str
@@ -241,12 +273,11 @@ class AttemptRecord:
     message: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        """Return a JSON-serialisable view of the record."""
+        """Return the client-safe view of the record (no raw error text)."""
         return {k: v for k, v in {
             "provider": self.provider,
             "outcome": self.outcome,
             "error_code": self.error_code,
-            "message": self.message,
         }.items() if v is not None}
 
 

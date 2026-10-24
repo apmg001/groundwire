@@ -209,6 +209,14 @@ the answer is returned with the report attached.
 | Client disconnects | Upstream call cancelled; breaker probe slot released without a verdict |
 | Grounding scorer crashes | `fail_open` → answer marked `unverified`; `fail_closed` → 503 |
 
+**What clients see when something fails:** a fixed, plain sentence per error type
+("The AI provider took too long to respond."), the error `code`, and a `request_id`. Never
+the provider's raw response, which can name vendor models, accounts or internal ids. The
+full text is logged under the same request ID, so operators lose nothing. Failed attempts in
+response metadata carry only `provider`, `outcome` and `error_code`. Tests send a marker
+string through every error path (rejected request, all providers down, failover, mid-stream
+failure) and assert it never reaches the client.
+
 **Streaming:** failover happens only before the first chunk is sent. After
 that, a provider failure is delivered in-band as an SSE `error` payload rather
 than silently switching models mid-sentence.

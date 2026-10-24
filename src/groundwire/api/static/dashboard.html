@@ -606,7 +606,7 @@ async function runScenario(s) {
   location.hash = "#/playground";
   setBusy(true);
   try { await s.run(); }
-  catch (err) { fillReply(addReply(), { text: "The page could not reach the gateway: " + err.message, tone: "blocked" }); }
+  catch { fillReply(addReply(), { text: "Couldn't reach the server. Check your connection and try again.", tone: "blocked" }); }
   finally { setBusy(false); refresh(); }
 }
 function setBusy(on) {
@@ -626,6 +626,20 @@ async function chat(question, { document: doc = null } = {}) {
   fillReply(reply, { by: modelName(meta.provider), text: r.body.choices[0].message.content || "(empty reply)",
                      checks: explain(meta), details: meta });
 }
+/* Friendly text per error code. The chat bubble never shows text sent by the server:
+   users see a plain sentence; the raw payload stays under "Technical details". */
+const FRIENDLY = {
+  prompt_injection_detected: "I can't help with that: this message looks like an attempt to override the AI's instructions.",
+  server_overloaded: "We're handling a lot of requests right now. Please try again in a moment.",
+  all_providers_failed: "Sorry, I couldn't get an answer right now. Please try again in a moment.",
+  gateway_timeout: "Sorry, that took too long. Please try again.",
+  upstream_rejected_request: "Sorry, the AI couldn't handle that request. Try rephrasing it or making it shorter.",
+  grounding_violation: "I couldn't give an answer that is supported by your document, so I didn't send one.",
+  answer_check_failed: "The AI's answer didn't match what actually happened, so it was held back.",
+  tool_call_blocked: "That action isn't allowed by the safety policy.",
+  invalid_request_error: "Sorry, that message couldn't be sent. Please try again.",
+};
+const FALLBACK_TEXT = "Sorry, something went wrong on our side. Please try again in a moment.";
 function showRefusal(reply, r) {
   const err = (r.body && r.body.error) || {};
   const checks = [];
@@ -635,11 +649,13 @@ function showRefusal(reply, r) {
     checks.push(["ok", "✓", "Nothing was sent to the AI, so nothing could leak."]);
   } else if (err.code === "server_overloaded") {
     checks.push(["warn", "!", "The gateway is at capacity and asked the app to retry in a second instead of making you wait."]);
+  } else if (err.code === "all_providers_failed") {
+    const tried = ((err.details || {}).attempts || []).length;
+    checks.push(["warn", "↻", `Groundwire tried ${tried > 1 ? "every available AI model (" + tried + ")" : "the available AI model"} before giving up, so you weren't left waiting on one that was down.`]);
   }
-  fillReply(reply, { by: "Groundwire", tone: "blocked",
-    text: err.code === "prompt_injection_detected" ? "I can't help with that: this message looks like an attempt to override the AI's instructions."
-          : (err.message || `Request refused (HTTP ${r.status}).`),
-    checks, details: r.body });
+  if (err.request_id && err.code !== "prompt_injection_detected")
+    checks.push(["info", "i", `Reference for support: ${err.request_id}`]);
+  fillReply(reply, { by: "Groundwire", tone: "blocked", text: FRIENDLY[err.code] || FALLBACK_TEXT, checks, details: r.body });
 }
 
 /* ---- failover test */
@@ -734,7 +750,9 @@ async function decideInline(ctx, action) {
   ctx.buttons.querySelectorAll("button").forEach(b => b.disabled = true);
   const r = await decide(ctx.held.approval_id, action);
   if (!r.ok) {
-    ctx.buttons.append(el("span", { class: "tag bad" }, (r.body && r.body.error && r.body.error.message) || "Could not decide"));
+    const already = r.status === 409, expired = r.status === 410;
+    ctx.buttons.append(el("span", { class: "tag bad" },
+      already ? "Someone already decided this one." : expired ? "This request expired." : "Couldn't record your decision. Please try again."));
     return;
   }
   await continueAfterDecision(ctx, action);
