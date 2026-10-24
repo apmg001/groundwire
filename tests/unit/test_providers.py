@@ -16,6 +16,7 @@ from groundwire.core.errors import (
     ProviderAuthError,
     ProviderBadRequestError,
     ProviderConnectionError,
+    ProviderNotFoundError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
@@ -110,6 +111,7 @@ async def test_openai_complete_success_and_payload() -> None:
     (400, ProviderBadRequestError),
     (401, ProviderAuthError),
     (403, ProviderAuthError),
+    (404, ProviderNotFoundError),  # e.g. a model the vendor retired
     (408, ProviderServerError),
     (422, ProviderBadRequestError),
     (500, ProviderServerError),

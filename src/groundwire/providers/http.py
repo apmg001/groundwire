@@ -27,6 +27,7 @@ from groundwire.core.errors import (
     ProviderBadRequestError,
     ProviderConnectionError,
     ProviderError,
+    ProviderNotFoundError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
@@ -155,6 +156,8 @@ def error_for_status(provider: str, status: int, body: str,
         return ProviderRateLimitError(message, retry_after_s=retry_after, **kwargs)
     if status in (401, 403):
         return ProviderAuthError(message, **kwargs)
+    if status == 404:  # model/endpoint missing: the provider's problem, not the client's
+        return ProviderNotFoundError(message, **kwargs)
     if status in (408, 409):  # timeout / conflict: transient by definition
         return ProviderServerError(message, **kwargs)
     if 400 <= status < 500:

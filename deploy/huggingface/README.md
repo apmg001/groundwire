@@ -16,7 +16,7 @@ with a live dashboard: click a scenario and watch PII redaction, prompt-injectio
 blocking, fact-checking, failover, tool-call guardrails and human approval happen.
 
 - Source and docs: https://github.com/apmg001/groundwire
-- Answers come from Llama 3.1 8B on Groq when available, otherwise from a backup
+- Answers come from OpenAI's open-weight GPT-OSS 20B on Groq when available, otherwise from a backup
   model (that switch is the gateway's failover at work).
 - Agent scenarios use scripted models and fake tools: nothing real is refunded.
 - The dashboard stores no prompt or answer text, only verdicts and counts.

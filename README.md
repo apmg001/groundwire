@@ -134,7 +134,7 @@ never appears in the feed. Turn it off with `dashboard.enabled: false`.
 
 ```bash
 make demo-live                 # http://localhost:7860
-GROQ_API_KEY=gsk_... make demo-live   # real answers from Llama 3.1 8B on Groq
+set -a; . ./.env; set +a; make demo-live   # real answers: GROQ_API_KEY=... in .env (git-ignored)
 ```
 
 `config/demo.yaml` gives the Playground eight one-click scenarios: PII redaction, prompt
@@ -200,7 +200,8 @@ the answer is returned with the report attached.
 | Connection error, 5xx, 529, 429 | Retried on the same provider with full-jitter backoff (honours `Retry-After`, capped), then fail over |
 | Timeout | Fail over at once: a provider that just used its whole timeout will likely do it again (`retry.retry_on_timeout: true` restores retry-in-place). Halved the worst case in the chaos load test, 20.4 s to 10.4 s |
 | 401 / 403 | No retry (won't fix itself); fail over; counts against the breaker |
-| 400 / 404 / 422 from upstream | Surfaced to the client as 400; **no** failover (the request itself is bad) |
+| 404 from upstream | The provider's model or endpoint doesn't exist (misconfigured, or retired by the vendor): no retry, fail over, counts against the breaker |
+| 400 / 422 from upstream | Surfaced to the client as 400; **no** failover (the request itself is bad) |
 | Provider keeps failing | Circuit opens after N consecutive failures; calls skip it instantly (no timeout cost) until a half-open probe succeeds |
 | Every provider down | HTTP 503 with a record of each attempt |
 | Too slow overall | HTTP 504 when `request_timeout_s` expires, across all retries and failover |

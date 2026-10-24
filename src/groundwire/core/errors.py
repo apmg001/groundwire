@@ -168,8 +168,23 @@ class ProviderAuthError(ProviderError):
     failover = True
 
 
+class ProviderNotFoundError(ProviderError):
+    """The provider answered 404: its model or endpoint does not exist.
+
+    The client asked for a route alias, not an upstream model, so a 404 means
+    this provider is misconfigured (or the vendor retired the model, as Groq
+    did with ``llama-3.1-8b-instant``). Like an auth error: not retryable,
+    but fail over, and count against the breaker so a broken provider is
+    skipped instead of failing every request.
+    """
+
+    code = "provider_not_found"
+    retryable = False
+    failover = True
+
+
 class ProviderBadRequestError(ProviderError):
-    """The provider rejected the request itself (400/404/422).
+    """The provider rejected the request itself (400/422 and other 4xx).
 
     Not retryable and no failover: the same request would most likely be
     rejected everywhere, so we surface it to the client as a 400.

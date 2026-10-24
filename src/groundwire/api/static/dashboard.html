@@ -444,7 +444,7 @@ const reviewer = () => state.token ? { Authorization: "Bearer " + state.token } 
 
 /* --------------------------------------------------------------- plain-English labels */
 const MODEL_NAMES = {
-  "groq": "Llama 3.1 8B (via Groq)", "fallback-mock": "Backup model",
+  "groq": "GPT-OSS 20B (via Groq)", "fallback-mock": "Backup model",
   "mock-flaky": "Unreliable test model", "mock-stable": "Reliable test model",
   "mock-agent": "Demo agent", "mock-agent-greedy": "Demo agent", "mock-agent-approval": "Demo agent",
   "mock-agent-liar": "Demo agent",
@@ -618,7 +618,7 @@ function setBusy(on) {
 async function chat(question, { document: doc = null } = {}) {
   addUser(question, doc ? el("div", { style: "opacity:.75;font-size:12.5px;margin-top:6px" }, "📄 Attached: " + doc) : null);
   const reply = addReply();
-  const body = { model: "default", user: VISITOR, temperature: 0.2, max_tokens: 350, messages: [{ role: "user", content: question }] };
+  const body = { model: "default", user: VISITOR, temperature: 0.2, max_tokens: 1024, messages: [{ role: "user", content: question }] };
   if (doc) body.groundwire = { grounding: { context: [doc], mode: "flag" } };
   const r = await api("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
   if (!r.ok) return showRefusal(reply, r);

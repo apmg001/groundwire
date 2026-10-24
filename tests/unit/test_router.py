@@ -11,6 +11,7 @@ from groundwire.core.errors import (
     ModelNotFoundError,
     ProviderAuthError,
     ProviderBadRequestError,
+    ProviderNotFoundError,
     ProviderServerError,
     ProviderTimeoutError,
 )
@@ -69,6 +70,21 @@ async def test_auth_error_fails_over_without_retry() -> None:
         "default", chat_request())
     assert result.provider == "secondary"
     assert primary.calls == 1
+
+
+async def test_missing_model_fails_over_and_counts_against_the_breaker() -> None:
+    """A 404 means the provider is misconfigured (retired model), not that the client erred."""
+    primary = ScriptedProvider("primary", ProviderNotFoundError(
+        "model does not exist", provider="primary", upstream_status=404))
+    router = _router(primary, ScriptedProvider("secondary", "backup answer"))
+    result = await router.complete("default", chat_request())
+    assert result.provider == "secondary"
+    assert primary.calls == 1  # not retried: it will not fix itself
+    assert result.attempts[0].error_code == "provider_not_found"
+    await router.complete("default", chat_request())  # second failure (threshold is 2)
+    assert router.breaker_states()["primary"] == "open"  # now skipped without a call
+    await router.complete("default", chat_request())
+    assert primary.calls == 2
 
 
 async def test_bad_request_is_surfaced_without_failover() -> None:

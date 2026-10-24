@@ -48,9 +48,11 @@ providers:
   - name: groq
     type: openai_compatible
     base_url: https://api.groq.com/openai/v1
-    model: llama-3.1-8b-instant
+    model: openai/gpt-oss-20b
     api_key_env: GROQ_API_KEY
     skip_if_no_key: true       # no key: start anyway and serve from the fallback
+    # Groq retires models (llama-3.1-8b-instant was shut down on 2026-08-16); if this one
+    # goes too, Groq answers 404 and the gateway fails over to the backup model.
     timeout_s: 20
     max_connections: 20
 
