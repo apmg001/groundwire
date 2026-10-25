@@ -151,20 +151,23 @@ failover sends visitors to the backup, which is the gateway doing its job in pub
 held calls. That is only acceptable because the demo's tools are fake: never enable it
 where a tool call does something real.
 
-### Deploy to Hugging Face Spaces (free)
+### Deploy to Render (free, no credit card)
 
-1. Create a Space at [huggingface.co/new-space](https://huggingface.co/new-space):
-   SDK **Docker**, template **Blank**, hardware **CPU basic (free)**.
-2. Upload the two files in `deploy/huggingface/` (`Dockerfile` and `README.md`) to the
-   Space, through the web UI ("Files" → "Add file") or with git.
-3. Optional: in the Space's **Settings → Variables and secrets**, add the secret
-   `GROQ_API_KEY` (free key from [console.groq.com](https://console.groq.com/keys)).
-4. The Space builds and starts on its own. The Dockerfile installs Groundwire from this
-   GitHub repo, so to deploy new code: push to GitHub, then **Settings → Factory rebuild**.
+The repo includes a [`render.yaml`](render.yaml) Blueprint:
 
-One worker and one replica, as the in-memory approval store requires (see
-[Workers and replicas](#workers-and-replicas)). Free Spaces sleep after a period without
-visitors and wake on the next visit.
+1. Sign in at [render.com](https://render.com) with GitHub, then **New → Blueprint** and pick
+   this repository (or your fork).
+2. Render reads `render.yaml` and asks for `GROQ_API_KEY` (optional; free key from
+   [console.groq.com](https://console.groq.com/keys)). It is stored as a secret on Render,
+   never in git, and never reaches the browser.
+3. **Apply.** The first build takes about 5-10 minutes; the root URL opens the web app.
+
+Every push to `main` redeploys. One instance, as the in-memory approval store requires (see
+[Workers and replicas](#workers-and-replicas)). The free plan sleeps after 15 idle minutes and
+takes about a minute to wake: open the link yourself before sharing it.
+
+*Hugging Face Spaces:* `deploy/huggingface/` still works, but Docker Spaces now need a paid
+plan.
 
 ---
 
@@ -1084,7 +1087,7 @@ src/groundwire/
   main.py         app factory and entrypoint
 tests/            unit + integration (no network needed)
 config/           gateway YAML (local, Docker, public demo, load test)
-deploy/           Prometheus config, Hugging Face Space files
+deploy/           Prometheus config, Hugging Face Space files (render.yaml at the root)
 scripts/          chaos demo, agent demo, reviewer CLI
 loadtest/         fake model server, Locust traffic, profiles, runner + report
 ```

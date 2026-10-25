@@ -1,5 +1,6 @@
 # --------------------------------------------------------------------------- #
 # Groundwire public demo for a Hugging Face Docker Space.
+# Note: Docker Spaces need a paid Hugging Face plan; render.yaml deploys free.
 #
 # The Space repo holds only this file and README.md: the gateway itself is
 # installed from GitHub, so pushing to GitHub + "Factory rebuild" in the

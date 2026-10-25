@@ -1,0 +1,23 @@
+# Render Blueprint: one-click deploy of the public demo (render.com -> New -> Blueprint).
+#
+# Free plan: 512 MB RAM (Groundwire uses ~70-110 MB), sleeps after 15 idle
+# minutes and wakes in about a minute on the next visit.
+# One instance only: the demo keeps approvals in memory (see "Workers and replicas").
+services:
+  - type: web
+    name: groundwire
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: true          # every push to main redeploys
+    envVars:
+      - key: GROUNDWIRE_CONFIG_PATH
+        value: /app/config/demo.yaml
+      - key: PORT             # Render routes traffic to this port
+        value: "8000"
+      - key: GROUNDWIRE_APPROVER_TOKEN
+        value: public-demo-reviewer-token   # public by design: demo tools are fake
+      - key: GROQ_API_KEY     # optional; without it a backup model answers
+        sync: false           # Render asks for the value; it is never stored in git
