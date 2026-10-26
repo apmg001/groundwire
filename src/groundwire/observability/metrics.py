@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
-from groundwire.resilience.circuit_breaker import CircuitState
-
 # Latency buckets sized for LLM calls: tens of ms (cache/mock) up to minutes.
 _LATENCY_BUCKETS = (0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 80, 160)
 
-_STATE_VALUE = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
+# Circuit states by their string value. Metrics sit *below* resilience in the
+# layering, so they take the state as text instead of importing the breaker's
+# enum (``CircuitState`` is a ``StrEnum`` whose members equal these strings).
+_STATE_VALUE = {"closed": 0, "half_open": 1, "open": 2}
 
 
 class GatewayMetrics:
@@ -141,14 +142,22 @@ class GatewayMetrics:
     # Recording helpers
     # ------------------------------------------------------------------ #
 
-    def set_circuit_state(self, provider: str, state: CircuitState) -> None:
+    def set_circuit_state(self, provider: str, state: str) -> None:
         """Record a provider's circuit state.
 
         Args:
             provider: Provider name.
-            state: New state.
+            state: New state: ``closed``, ``half_open`` or ``open`` (a
+                ``CircuitState`` member works, being a string enum).
+
+        Raises:
+            ValueError: If ``state`` is not a known circuit state.
         """
-        self.circuit_state.labels(provider=provider).set(_STATE_VALUE[state])
+        try:
+            value = _STATE_VALUE[str(state)]
+        except KeyError as exc:
+            raise ValueError(f"unknown circuit state {state!r}") from exc
+        self.circuit_state.labels(provider=provider).set(value)
 
     def record_attempt(self, provider: str, outcome: str, error_code: str = "") -> None:
         """Count one provider attempt.

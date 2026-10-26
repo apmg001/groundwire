@@ -207,3 +207,16 @@ def test_state_listener_errors_do_not_propagate() -> None:
     breaker = CircuitBreaker("p", cfg, clock=_Clock(), on_state_change=broken_listener)
     breaker.record_failure()  # must not raise
     assert breaker.state is CircuitState.OPEN
+
+
+def test_metrics_record_every_breaker_state_without_importing_the_breaker() -> None:
+    from groundwire.observability.metrics import GatewayMetrics
+
+    metrics = GatewayMetrics()
+    for state, value in ((CircuitState.CLOSED, 0), (CircuitState.HALF_OPEN, 1),
+                         (CircuitState.OPEN, 2)):
+        metrics.set_circuit_state("p", state)
+        assert metrics.registry.get_sample_value(
+            "groundwire_circuit_state", {"provider": "p"}) == value
+    with pytest.raises(ValueError, match="unknown circuit state"):
+        metrics.set_circuit_state("p", "melted")
