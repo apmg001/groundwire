@@ -22,6 +22,10 @@ OpenAI SDK at it by changing one URL, and every call gets:
 
 Runs fully offline on a laptop CPU. No GPU, no cloud account required.
 
+> **Built on Groundwire: [Groundwire Money](apps/money-agent/)**, a personal-finance
+> agent that remembers your goals and checks every figure against your bank statement
+> before you see it (Postgres + pgvector memory, self-correcting agent loop, 194 tests).
+
 ---
 
 ## Architecture

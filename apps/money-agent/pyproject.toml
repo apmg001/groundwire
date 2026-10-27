@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "groundwire-money"
+version = "0.1.0"
+description = "A personal-finance agent that remembers you and can't lie about your money (guarded by Groundwire)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Prasun Mani Gupta", email = "apmgupta001@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-multipart>=0.0.9",
+    "psycopg[binary,pool]>=3.2",
+]
+
+[project.scripts]
+money-agent = "money_agent.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/money_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "postgres: needs a real Postgres with pgvector (set MONEY_TEST_DATABASE_URL)",
+    "gateway: runs a real Groundwire gateway in-process (needs groundwire installed)",
+]
+filterwarnings = [
+    "error",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["money_agent"]
+branch = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "BLE", "A", "C4", "SIM", "RET", "PTH", "LOG", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "BLE"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/money_agent"]
+plugins = ["pydantic.mypy"]

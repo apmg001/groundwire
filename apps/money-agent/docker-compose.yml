@@ -1,0 +1,58 @@
+# The whole stack on one machine:
+#
+#   GROQ_API_KEY=... docker compose up --build      (run from apps/money-agent)
+#   open http://localhost:8100
+#
+#   postgres     Postgres 16 + pgvector (data in a named volume)
+#   groundwire   the gateway, with this app's config (PII, injection, answer check)
+#   money-agent  the app; scale it with: docker compose up --scale money-agent=3
+#                (stateless: every replica shares Postgres; migrations take a lock)
+#
+# Without GROQ_API_KEY the gateway answers from its offline backup model.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: money
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-money-dev-only}
+      POSTGRES_DB: money
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U money -d money"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  groundwire:
+    build: ../..
+    environment:
+      GROUNDWIRE_CONFIG_PATH: /app/money/groundwire.yaml
+      GROUNDWIRE_LOG_JSON: "true"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - ./deploy/groundwire.yaml:/app/money/groundwire.yaml:ro
+    ports:
+      - "8000:8000"     # gateway dashboard at http://localhost:8000/dashboard
+    restart: unless-stopped
+
+  money-agent:
+    build: .
+    environment:
+      MONEY_STORAGE: postgres
+      MONEY_DATABASE_URL: postgresql://money:${POSTGRES_PASSWORD:-money-dev-only}@postgres:5432/money
+      MONEY_GATEWAY_URL: http://groundwire:8000
+      MONEY_LOG_JSON: "true"
+    ports:
+      - "8100:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      groundwire:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:

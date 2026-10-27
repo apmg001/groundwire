@@ -1,0 +1,69 @@
+# --------------------------------------------------------------------------- #
+# Groundwire config for Groundwire Money.
+#
+# The money agent sends every model call here. This gateway:
+#   - hides personal data (phone, email, card, PAN, Aadhaar) from the model,
+#   - blocks prompt-injection attempts, including ones hidden in statement rows,
+#   - fact-checks every final answer against the tool results (answer_check),
+#   - fails over to a backup when the free model is down or rate-limited.
+#
+# answer_check runs in "flag" mode on purpose: the money agent reads the
+# verdict and asks the model to correct itself before the user sees anything
+# (see agent/runner.py), which a hard block here would prevent.
+# --------------------------------------------------------------------------- #
+
+request_timeout_s: 40
+
+retry:
+  max_attempts: 2
+  base_delay_s: 0.3
+  max_delay_s: 2.0
+
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout_s: 30
+  half_open_max_calls: 1
+
+safety:
+  injection:
+    action: block
+    detector: heuristic
+    threshold: 0.7
+  pii:
+    enabled: true
+    types: [email, phone, card, aadhaar, pan]
+    restore_output: true
+
+# Answers depend on each user's tool results; caching them buys little and
+# risks serving one user's figures to another.
+cache:
+  enabled: false
+
+answer_check:
+  enabled: true
+  action: flag
+
+providers:
+  - name: groq
+    type: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    model: openai/gpt-oss-20b
+    api_key_env: GROQ_API_KEY
+    skip_if_no_key: true
+    timeout_s: 30
+    max_connections: 20
+
+  - name: backup
+    type: mock
+    model: backup
+    mock:
+      response_text: >-
+        I can't reach the AI model right now, so I can't look at your figures. Please try
+        again in a minute. Your data is safe and nothing was changed.
+      latency_s: 0.05
+
+routes:
+  default: [groq, backup]
+
+dashboard:
+  enabled: true

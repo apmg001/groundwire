@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Groundwire Money</title>
+  <meta name="description" content="A money assistant that remembers your goals and checks every figure against your bank statement.">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">₹</span>
+      <div>
+        <h1>Groundwire Money</h1>
+        <p class="tagline">Remembers your goals. Checks every figure against your statement.</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" id="sample" class="ghost">Try sample data</button>
+      <label class="button primary" for="upload">Upload statement (CSV)</label>
+      <input type="file" id="upload" accept=".csv,text/csv" hidden>
+    </div>
+  </header>
+
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+  <main class="layout">
+    <section class="chat" aria-label="Chat">
+      <ol id="messages" class="messages" aria-live="polite">
+        <li class="msg assistant intro">
+          <div class="bubble">
+            <p>Hi! Upload your bank statement (or try the sample data), then ask me things like
+              how much you spent on food, which subscriptions you pay for, or whether you can
+              afford a goal.</p>
+            <p class="muted">Every figure I give is checked against your data before you see it.</p>
+          </div>
+        </li>
+      </ol>
+      <div id="suggestions" class="suggestions">
+        <button type="button" class="chip">How did I do last month?</button>
+        <button type="button" class="chip">What are my subscriptions and EMIs?</button>
+        <button type="button" class="chip">I'm saving ₹1,20,000 for a bike by June 2027. Am I on track?</button>
+        <button type="button" class="chip">Where does most of my money go?</button>
+      </div>
+      <form id="composer" class="composer" autocomplete="off">
+        <label for="input" class="visually-hidden">Message</label>
+        <textarea id="input" rows="1" maxlength="4000" placeholder="Ask about your money…" required></textarea>
+        <button type="submit" id="send" class="primary">Send</button>
+      </form>
+    </section>
+
+    <aside class="panel" aria-label="Your money">
+      <section class="card">
+        <div class="card-head">
+          <h2>Your month</h2>
+          <span id="period" class="muted"></span>
+        </div>
+        <div id="summary-empty" class="muted">No statement yet.</div>
+        <div id="summary" hidden>
+          <dl class="stats">
+            <div><dt>Income</dt><dd id="income"></dd></div>
+            <div><dt>Spent</dt><dd id="spending"></dd></div>
+            <div><dt>Invested</dt><dd id="invested"></dd></div>
+            <div><dt>Saved</dt><dd id="saved"></dd></div>
+          </dl>
+          <p class="rate">Savings rate <strong id="rate"></strong></p>
+          <h3>Where it went</h3>
+          <ul id="categories" class="bars"></ul>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>What I remember</h2></div>
+        <ul id="memories" class="memories"></ul>
+        <p id="memories-empty" class="muted">Tell me a goal or a preference and I'll remember it.</p>
+      </section>
+      <p class="disclaimer">Not investment advice. This is a demo: use the sample data or a
+        statement you're comfortable sharing.</p>
+    </aside>
+  </main>
+</body>
+</html>

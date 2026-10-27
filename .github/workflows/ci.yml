@@ -90,3 +90,45 @@ jobs:
             -H 'content-type: application/json' \
             -d '{"model":"demo","messages":[{"role":"user","content":"hi"}]}'
           docker logs gw
+
+  money-agent:
+    # apps/money-agent: lint, strict types, and every test, including the storage
+    # contract on a real Postgres + pgvector and end-to-end runs through a real
+    # Groundwire gateway (installed from this checkout).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/money-agent
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: money
+          POSTGRES_PASSWORD: money
+          POSTGRES_DB: money_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U money -d money_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      MONEY_TEST_DATABASE_URL: postgresql://money:money@localhost:5432/money_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (app + gateway for the end-to-end tests)
+        run: pip install -e ../.. -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest --cov --cov-report=term-missing --cov-fail-under=90
