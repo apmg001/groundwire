@@ -86,17 +86,26 @@ button:focus-visible, .button:focus-visible, textarea:focus-visible { outline: 2
   display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 1rem;
   padding: 1rem 1.25rem; max-width: 1200px; margin: 0 auto;
 }
+
 .chat {
+  min-width: 0;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
   display: flex; flex-direction: column; min-height: calc(100vh - 140px);
 }
 .messages { list-style: none; margin: 0; padding: 1rem; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: .9rem; }
-.msg { display: flex; flex-direction: column; max-width: 85%; }
+.msg { display: flex; flex-direction: column; max-width: 85%; min-width: 0; }
 .msg.user { align-self: flex-end; align-items: flex-end; }
-.bubble { padding: .7rem .95rem; border-radius: 14px; background: var(--surface-2); overflow-wrap: anywhere; }
+.bubble { padding: .7rem .95rem; border-radius: 14px; background: var(--surface-2); overflow-wrap: anywhere; min-width: 0; max-width: 100%; }
 .bubble p { margin: 0 0 .5rem; }
 .bubble p:last-child, .bubble ul:last-child { margin-bottom: 0; }
 .bubble ul { margin: 0 0 .5rem; padding-left: 1.2rem; }
+.bubble .heading { font-weight: 700; margin-top: .25rem; }
+.table-wrap { overflow-x: auto; max-width: 100%; margin: 0 0 .6rem; }
+.bubble table { border-collapse: collapse; font-size: .9rem; min-width: 60%; }
+.bubble th, .bubble td { padding: .3rem .6rem; border-bottom: 1px solid var(--line); text-align: left; overflow-wrap: normal; }
+.bubble th { color: var(--muted); font-weight: 600; font-size: .8rem; }
+.bubble td.num, .bubble th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bubble tbody tr:last-child td { border-bottom: none; }
 .msg.user .bubble { background: var(--accent); color: var(--accent-text); }
 .msg.pending .bubble { color: var(--muted); font-style: italic; }
 .meta { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .35rem; font-size: .78rem; }
@@ -135,11 +144,14 @@ textarea {
 .disclaimer { font-size: .78rem; color: var(--muted); margin: 0 .25rem; }
 
 @media (max-width: 860px) {
-  .layout { grid-template-columns: 1fr; padding: .75rem 16px; }
+  .layout { grid-template-columns: minmax(0, 1fr); padding: .75rem 16px; }
   .topbar { padding: .75rem 16px; }
   .notice { margin: .75rem 16px 0; }
   .chat { min-height: 70vh; }
   .msg { max-width: 95%; }
+  .msg.assistant { max-width: 100%; }
+  .bubble { padding: .6rem .7rem; }
+  .bubble th, .bubble td { padding: .3rem .35rem; }
   .actions { width: 100%; }
   .actions > * { flex: 1; justify-content: center; }
 }

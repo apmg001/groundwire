@@ -76,26 +76,63 @@
     return node;
   }
 
-  // Minimal, safe formatting: paragraphs, "- " bullets and **bold**.
+  // Minimal, safe formatting: paragraphs, headings, "- " bullets, **bold** and
+  // Markdown tables (models like to answer with tables). Text only, never HTML.
   function inline(text) {
     const parts = text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean);
     return parts.map((part) => part.startsWith("**") && part.endsWith("**")
       ? el("strong", { text: part.slice(2, -2) })
       : document.createTextNode(part));
   }
+  const TABLE_ROW = /^\|.*\|$/;
+  const TABLE_RULE = /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/;
+  const NUMERIC = /^[-+]?\s*(₹|rs\.?)?\s*[\d,]+(\.\d+)?\s*%?$/i;
+
+  function cells(row) {
+    return row.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  }
+  function table(rows) {
+    const [head = [], ...body] = rows.filter((row) => !TABLE_RULE.test(row)).map(cells);
+    const isNumber = (text) => NUMERIC.test(text.replace(/\*/g, ""));
+    // A column is numeric when most of its cells are: its heading aligns with them.
+    const numericColumn = head.map((_, col) => {
+      const values = body.map((r) => r[col] || "").filter(Boolean);
+      return values.length > 0 && values.filter(isNumber).length * 2 > values.length;
+    });
+    const cell = (tag, text, numeric) => {
+      const node = el(tag, {}, inline(text));
+      if (numeric) node.className = "num";
+      return node;
+    };
+    const thead = el("thead", {}, [el("tr", {}, head.map((c, i) => cell("th", c, numericColumn[i])))]);
+    const tbody = el("tbody", {}, body.map((r) =>
+      el("tr", {}, r.map((c, i) => cell("td", c, isNumber(c) || (numericColumn[i] && !c))))));
+    return el("div", { class: "table-wrap" }, [el("table", {}, [thead, tbody])]);
+  }
   function formatted(text) {
     const box = document.createDocumentFragment();
+    const lines = text.split("\n").map((raw) => raw.trim());
     let list = null;
-    for (const raw of text.split("\n")) {
-      const line = raw.trim();
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (TABLE_ROW.test(line)) {
+        const rows = [];
+        while (i < lines.length && TABLE_ROW.test(lines[i])) rows.push(lines[i++]);
+        i--;
+        list = null;
+        box.append(table(rows));
+        continue;
+      }
+      const heading = line.match(/^#{1,6}\s+(.*)$/);
       const bullet = line.match(/^([-*•]|\d+\.)\s+(.*)$/);
       if (bullet) {
         if (!list) { list = el("ul"); box.append(list); }
         list.append(el("li", {}, inline(bullet[2])));
-      } else {
-        list = null;
-        if (line) box.append(el("p", {}, inline(line)));
+        continue;
       }
+      list = null;
+      if (heading) box.append(el("p", { class: "heading" }, inline(heading[1])));
+      else if (line) box.append(el("p", {}, inline(line)));
     }
     return box;
   }
