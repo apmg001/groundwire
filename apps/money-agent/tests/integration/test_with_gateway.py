@@ -5,7 +5,8 @@ models instead of an LLM (deterministic, no API key, no internet):
 
 * ``honest``: calls ``get_spending_summary`` and then states the true figures;
 * ``liar``: calls the same tool and then states a made-up savings figure;
-* ``lister``: calls ``list_transactions`` (raw narrations reach the model).
+* ``lister``: calls ``list_transactions`` (raw narrations reach the model);
+* ``vague``: calls a tool, then answers without any figure.
 
 These tests prove the whole chain, not a stub of it: the money agent's HTTP
 client, Groundwire's tool forwarding, its answer check on real tool results,
@@ -55,8 +56,10 @@ GATEWAY_CONFIG: dict[str, Any] = {
     "cache": {"enabled": False},
     "answer_check": {"enabled": True, "action": "flag"},
     "providers": [_mock("honest", TRUTH), _mock("liar", LIE),
-                  _mock("lister", "Here are your transactions.", "list_transactions")],
-    "routes": {"default": ["honest"], "liar": ["liar"], "lister": ["lister"]},
+                  _mock("lister", "Here are your transactions.", "list_transactions"),
+                  _mock("vague", "You are doing fine overall.")],
+    "routes": {"default": ["honest"], "liar": ["liar"], "lister": ["lister"],
+               "vague": ["vague"]},
     "dashboard": {"enabled": False},
 }
 
@@ -125,6 +128,13 @@ def test_a_made_up_figure_is_caught_and_flagged(gateway_url: str,
     assert body["verification"]["status"] == "failed"
     assert "number_mismatch" in body["verification"]["problems"]
     assert [t["name"] for t in body["tools"]] == ["get_spending_summary"] * 2
+
+
+def test_an_answer_without_figures_is_not_called_verified(gateway_url: str,
+                                                          sample_bytes: bytes) -> None:
+    with _app(gateway_url, model="vague") as client:
+        response = _ask(client, sample_bytes, "How did I do last month?")
+    assert response.json()["verification"]["status"] == "not_needed"
 
 
 def test_prompt_injection_from_the_user_is_refused(gateway_url: str,

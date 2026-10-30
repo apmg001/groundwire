@@ -47,12 +47,13 @@ def tool_call(name: str, arguments: dict[str, Any] | None = None,
         finish_reason="tool_calls")
 
 
-def answer(text: str, verdict: str | None = "supported",
-           issues: Sequence[str] = ()) -> LLMReply:
+def answer(text: str, verdict: str | None = "supported", issues: Sequence[str] = (),
+           numbers_checked: int = 1) -> LLMReply:
     """A final reply, with the gateway's answer-check verdict."""
     gateway: dict[str, Any] = {}
     if verdict is not None:
-        gateway["answer_check"] = {"verdict": verdict,
+        gateway["answer_check"] = {"verdict": verdict, "numbers_checked": numbers_checked,
+                                   "actions_checked": 0,
                                    "issues": [{"kind": kind} for kind in issues]}
     return LLMReply(content=text, finish_reason="stop", gateway=gateway)
 

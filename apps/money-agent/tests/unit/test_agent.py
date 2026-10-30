@@ -261,6 +261,18 @@ async def test_no_answer_within_budget_is_an_agent_error() -> None:
         _runner(ScriptedLLM(), max_steps=0)
 
 
+def test_nothing_checked_means_no_verified_badge() -> None:
+    # "Please upload a statement" and the backup model's "I can't reach the AI
+    # model" pass the check only because they contain no figures: not "verified".
+    assert verification_of(answer("Please upload a statement.", numbers_checked=0))[0] \
+        is VerificationStatus.NOT_NEEDED
+    no_counts = LLMReply(content="x", gateway={"answer_check": {"verdict": "supported"}})
+    assert verification_of(no_counts)[0] is VerificationStatus.NOT_NEEDED
+    actions_only = LLMReply(content="I've remembered that.", gateway={"answer_check": {
+        "verdict": "supported", "numbers_checked": 0, "actions_checked": 1}})
+    assert verification_of(actions_only)[0] is VerificationStatus.VERIFIED
+
+
 def test_verification_reading() -> None:
     assert verification_of(answer("x", None))[0] is VerificationStatus.UNAVAILABLE
     assert verification_of(answer("x", "skipped"))[0] is VerificationStatus.NOT_NEEDED

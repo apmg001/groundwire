@@ -110,6 +110,12 @@ class AgentRun:
 def verification_of(reply: LLMReply) -> tuple[VerificationStatus, tuple[str, ...]]:
     """Read the gateway's answer-check metadata.
 
+    "Verified" is a promise to the user, so it is only given when the check
+    actually compared something: an answer with no figures and no claimed
+    actions ("please upload a statement", or the backup model's "I can't reach
+    the AI model") passes the check trivially and gets ``NOT_NEEDED``, not a
+    verified badge. Missing counts are treated as zero for the same reason.
+
     Args:
         reply: A final model reply.
 
@@ -121,12 +127,18 @@ def verification_of(reply: LLMReply) -> tuple[VerificationStatus, tuple[str, ...
         return VerificationStatus.UNAVAILABLE, ()
     verdict = check.get("verdict")
     if verdict == "supported":
-        return VerificationStatus.VERIFIED, ()
+        checked = _count(check.get("numbers_checked")) + _count(check.get("actions_checked"))
+        return (VerificationStatus.VERIFIED if checked else VerificationStatus.NOT_NEEDED), ()
     if verdict == "mismatch":
         kinds = sorted({str(i.get("kind")) for i in check.get("issues", [])
                         if isinstance(i, dict)})
         return VerificationStatus.FAILED, tuple(kinds)
     return VerificationStatus.NOT_NEEDED, ()
+
+
+def _count(value: Any) -> int:
+    """A non-negative count from gateway metadata (anything else counts as zero)."""
+    return value if isinstance(value, int) and value > 0 else 0
 
 
 class AgentRunner:
