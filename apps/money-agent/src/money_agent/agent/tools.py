@@ -106,13 +106,55 @@ def error_result(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"error": code, "message": message, **extra}
 
 
-def _clean_schema(node: Any) -> Any:
-    """Drop Pydantic's ``title`` keys: noise for the model, tokens for nothing."""
-    if isinstance(node, dict):
-        return {k: _clean_schema(v) for k, v in node.items() if k != "title"}
-    if isinstance(node, list):
-        return [_clean_schema(item) for item in node]
-    return node
+# Schema keys that cost prompt tokens on every model call but don't help the model
+# choose or fill a tool. Validation never relies on the sent schema: the Pydantic
+# model validates every call on our side, with all its constraints.
+_SCHEMA_NOISE = frozenset({"title", "additionalProperties", "maxLength", "minLength"})
+
+
+def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """A token-lean JSON schema for the model, from Pydantic's full one.
+
+    Keeps names, types, enums, formats, patterns, numeric ranges and field
+    descriptions; inlines ``$ref`` definitions; turns ``anyOf[X, null]`` into
+    ``X`` (optional fields are simply not ``required``); drops titles, null
+    defaults, docstring descriptions of models and enums, and length limits.
+
+    Args:
+        schema: ``model_json_schema()`` output.
+
+    Returns:
+        The compact schema (about half the size on this toolkit).
+    """
+    definitions = schema.get("$defs", {})
+
+    def walk(node: Any, *, field: bool) -> Any:
+        if isinstance(node, list):
+            return [walk(item, field=field) for item in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            target = definitions[node["$ref"].rsplit("/", 1)[-1]]
+            return walk({k: v for k, v in target.items() if k != "description"}, field=False)
+        options = node.get("anyOf")
+        if isinstance(options, list):
+            concrete = [o for o in options if o != {"type": "null"}]
+            if len(concrete) == 1:
+                merged = {**concrete[0], **{k: v for k, v in node.items() if k != "anyOf"}}
+                return walk(merged, field=field)
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in _SCHEMA_NOISE or key == "$defs" or (key == "default" and value is None):
+                continue
+            if key == "description" and not field:
+                continue  # model/enum docstrings repeat the tool description
+            if key == "properties":
+                out[key] = {name: walk(prop, field=True) for name, prop in value.items()}
+            else:
+                out[key] = walk(value, field=False)
+        return out
+
+    return walk(schema, field=False)  # type: ignore[no-any-return]
 
 
 class Tool(ABC, Generic[ArgsT]):
@@ -142,7 +184,7 @@ class Tool(ABC, Generic[ArgsT]):
         """The OpenAI-format tool definition."""
         return {"type": "function", "function": {
             "name": self.name, "description": self.description,
-            "parameters": _clean_schema(self.args_model.model_json_schema())}}
+            "parameters": compact_schema(self.args_model.model_json_schema())}}
 
     @abstractmethod
     async def run(self, context: ToolContext, args: ArgsT) -> dict[str, Any]:

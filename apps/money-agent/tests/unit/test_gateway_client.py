@@ -61,6 +61,12 @@ async def test_success_is_parsed_and_the_request_is_well_formed() -> None:
     assert body["user"] == "u1" and body["tool_choice"] == "auto" and body["model"] == "default"
 
 
+async def test_reply_length_is_capped_when_configured() -> None:
+    client, seen = _client(lambda _: httpx.Response(200, json=OK_BODY), max_tokens=900)
+    await client.complete([{"role": "user", "content": "hi"}], tools=[], user="u1")
+    assert json.loads(seen[0].content)["max_tokens"] == 900
+
+
 async def test_no_tools_means_no_tool_fields() -> None:
     client, seen = _client(lambda _: httpx.Response(200, json=OK_BODY))
     await client.complete([{"role": "user", "content": "hi"}], tools=[], user="u1")

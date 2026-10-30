@@ -53,6 +53,18 @@ providers:
     timeout_s: 30
     max_connections: 20
 
+  # Second Groq model: free tiers limit tokens per minute *per model*, so when
+  # gpt-oss-20b is busy (an agent makes several calls per question), this one
+  # usually is not. Check the current model list at console.groq.com.
+  - name: groq-large
+    type: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    model: openai/gpt-oss-120b
+    api_key_env: GROQ_API_KEY
+    skip_if_no_key: true
+    timeout_s: 30
+    max_connections: 20
+
   - name: backup
     type: mock
     model: backup
@@ -63,7 +75,7 @@ providers:
       latency_s: 0.05
 
 routes:
-  default: [groq, backup]
+  default: [groq, groq-large, backup]
 
 dashboard:
   enabled: true

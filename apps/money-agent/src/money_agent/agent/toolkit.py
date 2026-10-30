@@ -27,6 +27,7 @@ from typing import Annotated, Any
 from pydantic import Field, field_validator
 
 from money_agent.agent.tools import Tool, ToolArgs, ToolContext, error_result
+from money_agent.core.errors import InvalidInputError
 from money_agent.domain.models import (
     Category,
     Direction,
@@ -57,8 +58,10 @@ def _totals(figures: Totals) -> dict[str, Any]:
 
 
 def _category_rows(rows: tuple[CategoryTotal, ...]) -> list[dict[str, Any]]:
-    return [{"category": r.category.value, "label": r.category.label, "total": str(r.total),
-             "count": r.count, "share_percent": str(r.share_percent)} for r in rows]
+    # The readable label only: the model needs one name per category, and every
+    # result is resent on each later model call of the turn.
+    return [{"category": r.category.label, "total": str(r.total), "count": r.count,
+             "share_percent": str(r.share_percent)} for r in rows]
 
 
 def _transaction(txn: Transaction) -> dict[str, Any]:
@@ -92,9 +95,8 @@ class SpendingSummaryTool(Tool[PeriodArgs]):
         """
         super().__init__(
             "get_spending_summary",
-            "Income, spending, investments, savings, savings rate and spending by category "
-            "for a month or date range. Defaults to the latest month with data. Use it for "
-            "any question about how much was earned, spent or saved.", PeriodArgs)
+            "Totals for a month or date range (default: latest month with data): income, "
+            "spending, invested, saved, savings rate, spending by category.", PeriodArgs)
         self._finance = finance
 
     async def run(self, context: ToolContext, args: PeriodArgs) -> dict[str, Any]:
@@ -106,7 +108,7 @@ class SpendingSummaryTool(Tool[PeriodArgs]):
                 "end": period.end.isoformat(), "transactions": summary.transactions,
                 **_totals(summary.totals),
                 "spending_by_category": _category_rows(summary.spending_by_category),
-                "income_by_category": _category_rows(summary.income_by_category)}
+                "income_by_category": _category_rows(summary.income_by_category[:3])}
 
 
 class ListTransactionsArgs(ToolArgs):
@@ -114,8 +116,7 @@ class ListTransactionsArgs(ToolArgs):
 
     category: Category | None = None
     search: Annotated[str | None, Field(max_length=60,
-                                        description="Text in the bank narration, e.g. a "
-                                                    "merchant name.")] = None
+                                        description="Merchant or narration text.")] = None
     direction: Direction | None = None
     start_date: date | None = None
     end_date: date | None = None
@@ -133,10 +134,8 @@ class ListTransactionsTool(Tool[ListTransactionsArgs]):
         """
         super().__init__(
             "list_transactions",
-            "Individual transactions, newest first, filtered by category, merchant text, "
-            f"direction or dates (at most {MAX_LISTED}). Use it to show or explain specific "
-            "payments, not to add up totals (use get_spending_summary for totals).",
-            ListTransactionsArgs)
+            f"Individual transactions, newest first (max {MAX_LISTED}). For totals use "
+            "get_spending_summary.", ListTransactionsArgs)
         self._finance = finance
 
     async def run(self, context: ToolContext, args: ListTransactionsArgs) -> dict[str, Any]:
@@ -167,8 +166,8 @@ class MonthlyTrendTool(Tool[TrendArgs]):
         """
         super().__init__(
             "get_monthly_trend",
-            "Income, spending, investments and savings for each recent month that has data, "
-            "oldest first. Use it to compare months or spot trends.", TrendArgs)
+            "Income, spending, invested and saved per month, oldest first. For comparing "
+            "months.", TrendArgs)
         self._finance = finance
 
     async def run(self, context: ToolContext, args: TrendArgs) -> dict[str, Any]:
@@ -192,9 +191,8 @@ class RecurringPaymentsTool(Tool[NoArgs]):
         """
         super().__init__(
             "find_recurring_payments",
-            "Payments that repeat about monthly (rent, EMIs, SIPs, subscriptions, bills), "
-            "with their typical amount. Use it for questions about fixed costs or "
-            "subscriptions.", NoArgs)
+            "Monthly repeating payments (rent, EMIs, SIPs, subscriptions, bills) with their "
+            "typical amounts.", NoArgs)
         self._finance = finance
 
     async def run(self, context: ToolContext, args: NoArgs) -> dict[str, Any]:
@@ -209,14 +207,44 @@ class RecurringPaymentsTool(Tool[NoArgs]):
 
 
 class GoalPlanArgs(ToolArgs):
-    """A savings target."""
+    """A savings target with a deadline month (or a number of months)."""
 
     target_amount: Annotated[Decimal, Field(gt=0, le=MAX_TARGET_RUPEES,
                                             description="Target in rupees.")]
-    months: Annotated[int, Field(ge=1, le=120, description="Months until the deadline.")]
+    deadline: Annotated[str | None, Field(pattern=r"^\d{4}-\d{2}$",
+                                          description="Deadline month, YYYY-MM.")] = None
+    months: Annotated[int | None, Field(ge=1, le=120,
+                                        description="Months to save, if no deadline.")] = None
     already_saved: Annotated[Decimal, Field(ge=0, le=MAX_TARGET_RUPEES,
                                             description="Rupees already put aside.")] = \
         Decimal(0)
+
+
+def months_until(today: date, deadline: str) -> int:
+    """Whole months from ``today``'s month to the deadline month (June from October: 8).
+
+    Args:
+        today: Today's date.
+        deadline: ``YYYY-MM``.
+
+    Returns:
+        The number of months.
+
+    Raises:
+        InvalidInputError: Malformed, past, or more than ten years away.
+    """
+    try:
+        year, month = (int(part) for part in deadline.split("-"))
+        if not 1 <= month <= 12:
+            raise ValueError(deadline)
+    except ValueError as exc:
+        raise InvalidInputError(f"bad deadline {deadline!r}",
+                                public_message="Deadlines are written as YYYY-MM.") from exc
+    months = (year - today.year) * 12 + (month - today.month)
+    if not 1 <= months <= 120:
+        raise InvalidInputError(f"deadline {deadline} is {months} months away",
+                                public_message="The deadline must be 1 to 120 months away.")
+    return months
 
 
 class PlanGoalTool(Tool[GoalPlanArgs]):
@@ -230,22 +258,34 @@ class PlanGoalTool(Tool[GoalPlanArgs]):
         """
         super().__init__(
             "plan_savings_goal",
-            "How much must be saved each month to reach a target in a number of months, "
-            "compared with the user's average monthly saving over recent complete months.",
+            "Monthly saving needed to reach a target by a deadline, compared with the "
+            "user's average monthly saving; returns every figure the answer needs.",
             GoalPlanArgs)
         self._finance = finance
 
     async def run(self, context: ToolContext, args: GoalPlanArgs) -> dict[str, Any]:
         """Plan the goal (see class docstring)."""
+        if (args.deadline is None) == (args.months is None):
+            return error_result("invalid_arguments", "Give either deadline or months.")
+        months = (args.months if args.months is not None
+                  else months_until(self._finance.today(), args.deadline or ""))
         plan = await self._finance.plan_goal(
-            context.user_id, target=Money.of(args.target_amount), months=args.months,
+            context.user_id, target=Money.of(args.target_amount), months=months,
             already_saved=Money.of(args.already_saved))
+
+        def money(value: Money | None) -> str | None:
+            return None if value is None else str(value)
+
         return {"target": str(plan.target), "already_saved": str(plan.already_saved),
-                "months": plan.months, "required_monthly": str(plan.required_monthly),
-                "average_monthly_saving": None if plan.average_monthly_saving is None
-                else str(plan.average_monthly_saving),
+                "remaining": str(plan.target - plan.already_saved
+                                 if plan.target > plan.already_saved else Money.zero()),
+                "deadline": args.deadline, "months": plan.months,
+                "required_monthly": str(plan.required_monthly),
+                "average_monthly_saving": money(plan.average_monthly_saving),
                 "based_on_months": plan.reference_months, "on_track": plan.on_track,
-                "monthly_gap": None if plan.monthly_gap is None else str(plan.monthly_gap)}
+                "monthly_gap": money(plan.monthly_gap),
+                "monthly_surplus": money(plan.monthly_surplus),
+                "months_needed_at_current_pace": plan.months_needed_at_pace}
 
 
 # --------------------------------------------------------------------------- #
@@ -258,10 +298,9 @@ class RememberArgs(ToolArgs):
 
     kind: Annotated[MemoryKind, Field(description="goal, fact or preference")]
     content: Annotated[str, Field(min_length=3, max_length=300,
-                                  description="One short sentence, in the third person, e.g. "
-                                              "'Saving for a bike: ₹1,20,000 by March 2027'.")]
+                                  description="One short third-person sentence.")]
     replaces_memory_id: Annotated[str | None, Field(
-        description="Id of a memory this one updates (from 'What you know').")] = None
+        description="Id of the memory this updates.")] = None
 
     @field_validator("replaces_memory_id")
     @classmethod
@@ -282,10 +321,8 @@ class RememberTool(Tool[RememberArgs]):
         """
         super().__init__(
             "remember",
-            "Remember a goal, fact or preference the user stated, for future conversations. "
-            "Use it when the user tells you something lasting (a goal, their salary date, "
-            "how they like answers), not for one-off questions. To change something you "
-            "already know, pass its id as replaces_memory_id.", RememberArgs)
+            "Save a lasting goal, fact or preference the user stated. To update one, pass "
+            "its id as replaces_memory_id.", RememberArgs)
         self._memory = memory
 
     async def run(self, context: ToolContext, args: RememberArgs) -> dict[str, Any]:
@@ -301,7 +338,7 @@ class RememberTool(Tool[RememberArgs]):
 class DeleteMemoryArgs(ToolArgs):
     """Which memory to delete."""
 
-    memory_id: Annotated[str, Field(description="Id from 'What you know'.")]
+    memory_id: str
 
     @field_validator("memory_id")
     @classmethod
@@ -321,8 +358,7 @@ class DeleteMemoryTool(Tool[DeleteMemoryArgs]):
         """
         super().__init__(
             "delete_memory",
-            "Delete something you remembered, when the user asks you to forget it or it is "
-            "no longer true.", DeleteMemoryArgs)
+            "Forget a saved memory by id.", DeleteMemoryArgs)
         self._memory = memory
 
     async def run(self, context: ToolContext, args: DeleteMemoryArgs) -> dict[str, Any]:
@@ -342,8 +378,7 @@ class ListMemoriesTool(Tool[NoArgs]):
         """
         super().__init__(
             "list_memories",
-            "Everything you remember about the user (goals, facts, preferences), with ids. "
-            "Use it when the user asks what you know about them.", NoArgs)
+            "All saved memories with ids.", NoArgs)
         self._memory = memory
 
     async def run(self, context: ToolContext, args: NoArgs) -> dict[str, Any]:

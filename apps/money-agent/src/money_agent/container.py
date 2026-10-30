@@ -166,7 +166,7 @@ def build_container(settings: Settings, *, llm: LLMClient | None = None,
         http_client, base_url=settings.gateway_url, model=settings.gateway_model,
         api_key=settings.gateway_api_key.get_secret_value() if settings.gateway_api_key
         else None, timeout_s=settings.gateway_timeout_s,
-        max_retries=settings.gateway_max_retries)
+        max_retries=settings.gateway_max_retries, max_tokens=settings.max_answer_tokens)
     runner = AgentRunner(model, ToolRegistry.of(default_tools(finance, memory)),
                          max_steps=settings.agent_max_steps,
                          unverified=settings.unverified_answers)

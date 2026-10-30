@@ -53,6 +53,8 @@ class Settings(BaseSettings):
         gateway_api_key: Bearer token for the gateway, if it requires one.
         gateway_timeout_s: Timeout for one gateway call.
         gateway_max_retries: Retries for transient gateway failures.
+        max_answer_tokens: Cap on each model reply (reasoning included). Free tiers
+            count it against tokens-per-minute, so it is kept modest.
         embedder: Embedder type.
         embedding_dim: Vector size (must match the migration's ``vector(N)``).
         embedding_url: Base URL of an OpenAI-compatible embeddings API (``http``).
@@ -85,6 +87,7 @@ class Settings(BaseSettings):
     gateway_api_key: SecretStr | None = None
     gateway_timeout_s: Annotated[float, Field(gt=0, le=300)] = 45.0
     gateway_max_retries: Annotated[int, Field(ge=0, le=5)] = 2
+    max_answer_tokens: Annotated[int, Field(ge=64, le=32_000)] = 1_200
 
     embedder: EmbedderType = EmbedderType.HASHING
     embedding_dim: Annotated[int, Field(ge=8, le=4096)] = 384
@@ -94,7 +97,7 @@ class Settings(BaseSettings):
 
     agent_max_steps: Annotated[int, Field(ge=1, le=20)] = 6
     unverified_answers: UnverifiedAnswers = UnverifiedAnswers.WARN
-    history_messages: Annotated[int, Field(ge=0, le=200)] = 20
+    history_messages: Annotated[int, Field(ge=0, le=200)] = 6
     memory_recall_limit: Annotated[int, Field(ge=0, le=50)] = 6
     max_memories_per_user: Annotated[int, Field(ge=1, le=10_000)] = 500
     max_statement_bytes: Annotated[int, Field(ge=1_024, le=50_000_000)] = 5_000_000

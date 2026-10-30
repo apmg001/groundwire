@@ -17,6 +17,7 @@ from money_agent.adapters.inmemory import (
 )
 from money_agent.agent.runner import (
     CORRECTION_PROMPT,
+    EMPTY_ANSWER_PROMPT,
     FINAL_ANSWER_PROMPT,
     WITHHELD_ANSWER,
     AgentRunner,
@@ -146,8 +147,7 @@ async def test_spending_summary_tool_returns_exact_strings(sample_bytes: bytes) 
         "85212.35", "38185.00", "47027.35")
     assert result["savings_rate_percent"] == "55.2"
     assert result["spending_by_category"][0] == {
-        "category": "rent", "label": "Rent", "total": "22000.00", "count": 1,
-        "share_percent": "57.6"}
+        "category": "Rent", "total": "22000.00", "count": 1, "share_percent": "57.6"}
 
 
 async def test_read_tools_on_the_sample(sample_bytes: bytes) -> None:
@@ -256,7 +256,8 @@ async def test_no_answer_within_budget_is_an_agent_error() -> None:
     with pytest.raises(AgentError):
         await _runner(llm, max_steps=2).run(CONTEXT, START)
     with pytest.raises(AgentError):
-        await _runner(ScriptedLLM(LLMReply(content="  "))).run(CONTEXT, START)
+        await _runner(ScriptedLLM(LLMReply(content="  "), LLMReply(content=""))).run(
+            CONTEXT, START)
     with pytest.raises(ValueError):
         _runner(ScriptedLLM(), max_steps=0)
 
@@ -271,6 +272,56 @@ def test_nothing_checked_means_no_verified_badge() -> None:
     actions_only = LLMReply(content="I've remembered that.", gateway={"answer_check": {
         "verdict": "supported", "numbers_checked": 0, "actions_checked": 1}})
     assert verification_of(actions_only)[0] is VerificationStatus.VERIFIED
+
+
+async def test_goal_tool_takes_a_deadline_and_returns_every_figure(sample_bytes: bytes) -> None:
+    registry = await _registry(sample_bytes)  # the clock says 28 Oct 2026
+    plan = await _run(registry, "plan_savings_goal", target_amount=120000,
+                      deadline="2027-06", already_saved=20000)
+    assert (plan["months"], plan["deadline"]) == (8, "2027-06")  # Nov..Jun, no model maths
+    assert (plan["remaining"], plan["required_monthly"]) == ("100000.00", "12500.00")
+    average = plan["average_monthly_saving"]
+    assert plan["monthly_surplus"] == f"{float(average) - 12500:.2f}"
+    assert plan["months_needed_at_current_pace"] == 3 and plan["monthly_gap"] == "0.00"
+    for bad in ({"months": 6, "deadline": "2027-06"}, {}, {"deadline": "2026-09"},
+                {"deadline": "2027-13"}, {"deadline": "2040-01"}):
+        result = await _run(registry, "plan_savings_goal", target_amount=1000, **bad)
+        assert "error" in result, bad
+
+
+async def test_an_empty_reply_after_a_failed_check_shows_the_flagged_answer() -> None:
+    llm = ScriptedLLM(answer("You saved ₹999.", "mismatch", ["number_mismatch"]),
+                      LLMReply(content=""))
+    run = await _runner(llm).run(CONTEXT, START)
+    assert run.answer == "You saved ₹999."  # shown, but flagged: never a crash
+    assert run.verification.status is VerificationStatus.FAILED
+
+
+async def test_an_empty_first_reply_gets_one_nudge() -> None:
+    llm = ScriptedLLM(LLMReply(content=""), answer("Here you go."))
+    run = await _runner(llm).run(CONTEXT, START)
+    assert run.answer == "Here you go."
+    assert llm.calls[1]["messages"][-1]["content"] == EMPTY_ANSWER_PROMPT
+
+
+async def test_budget_exhausted_after_a_failed_check_still_answers() -> None:
+    llm = ScriptedLLM(answer("₹1.", "mismatch", ["number_mismatch"]),
+                      tool_call("echo", {"text": "a"}), tool_call("echo", {"text": "b"}))
+    run = await _runner(llm, max_steps=3).run(CONTEXT, START)
+    assert run.answer == "₹1." and run.verification.status is VerificationStatus.FAILED
+
+
+def test_tool_schemas_are_compact_but_complete() -> None:
+    definitions = ToolRegistry.of(default_tools(None, None)).definitions()  # type: ignore[arg-type]
+    text = json.dumps(definitions)
+    assert "$defs" not in text and "$ref" not in text and '"null"' not in text
+    assert "title" not in text and "additionalProperties" not in text
+    listing = next(d for d in definitions if d["function"]["name"] == "list_transactions")
+    props = listing["function"]["parameters"]["properties"]
+    assert "food_dining" in props["category"]["enum"]           # enums inlined
+    assert props["limit"] == {"default": 10, "maximum": 20, "minimum": 1, "type": "integer"}
+    assert props["search"]["description"]                        # field help kept
+    assert len(text) < 4_000                                     # was ~6,000 characters
 
 
 def test_verification_reading() -> None:

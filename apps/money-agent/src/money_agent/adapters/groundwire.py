@@ -47,7 +47,7 @@ class GroundwireClient:
 
     def __init__(self, client: httpx.AsyncClient, *, base_url: str, model: str,
                  api_key: str | None = None, timeout_s: float = 45.0,
-                 max_retries: int = 2) -> None:
+                 max_retries: int = 2, max_tokens: int | None = None) -> None:
         """Create the client.
 
         Args:
@@ -57,6 +57,7 @@ class GroundwireClient:
             api_key: Bearer token, if the gateway requires one.
             timeout_s: Timeout per attempt.
             max_retries: Retries for transient failures.
+            max_tokens: Cap on each reply (``None``: the provider's default).
         """
         self._client = client
         self._url = f"{base_url.rstrip('/')}/v1/chat/completions"
@@ -64,6 +65,7 @@ class GroundwireClient:
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._timeout = timeout_s
         self._max_retries = max_retries
+        self._max_tokens = max_tokens
 
     async def complete(self, messages: Sequence[dict[str, Any]], *,
                        tools: Sequence[dict[str, Any]], user: str) -> LLMReply:
@@ -83,6 +85,8 @@ class GroundwireClient:
         """
         payload: dict[str, Any] = {"model": self._model, "messages": list(messages),
                                    "user": user, "temperature": 0.2}
+        if self._max_tokens is not None:
+            payload["max_tokens"] = self._max_tokens
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"

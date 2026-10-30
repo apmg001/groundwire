@@ -211,6 +211,9 @@ class GoalPlan:
         reference_months: Months the average is based on.
         on_track: Whether the average covers the requirement.
         monthly_gap: Extra saving needed each month (zero when on track).
+        monthly_surplus: Average saving beyond the requirement (zero when short).
+        months_needed_at_pace: Months to reach the target at the average pace
+            (``None`` without history or when the average is not positive).
     """
 
     target: Money
@@ -221,6 +224,8 @@ class GoalPlan:
     reference_months: int
     on_track: bool | None
     monthly_gap: Money | None
+    monthly_surplus: Money | None = None
+    months_needed_at_pace: int | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -380,8 +385,12 @@ def plan_goal(transactions: Sequence[Transaction], *, target: Money, months: int
         return GoalPlan(target, already_saved, months, required, None, 0, None, None)
     average = sum((m.totals.saved for m in history), Money.zero()).divided_by(len(history))
     gap = required - average if required > average else Money.zero()
+    surplus = average - required if average > required else Money.zero()
+    needed = (None if average.paise <= 0
+              else -(-remaining.paise // average.paise))  # ceiling division, exact
     return GoalPlan(target, already_saved, months, required, average, len(history),
-                    on_track=not gap, monthly_gap=gap)
+                    on_track=not gap, monthly_gap=gap, monthly_surplus=surplus,
+                    months_needed_at_pace=needed)
 
 
 def _by_category(items: Sequence[Transaction], whole: Money) -> tuple[CategoryTotal, ...]:

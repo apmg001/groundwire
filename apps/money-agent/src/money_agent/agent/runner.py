@@ -45,6 +45,9 @@ CORRECTION_PROMPT = (
 FINAL_ANSWER_PROMPT = (
     "[Automatic check] You have used all your tool calls for this message. Answer now "
     "with the information you already have, and say what you could not find.")
+EMPTY_ANSWER_PROMPT = (
+    "[Automatic check] Your last reply was empty. Answer the user's question now in "
+    "a few sentences, using the tool results above.")
 WITHHELD_ANSWER = (
     "I couldn't verify my answer against your data, so I'm not showing it. Please try "
     "asking in a different way, or ask about one thing at a time.")
@@ -187,6 +190,9 @@ class AgentRunner:
         traces: list[ToolTrace] = []
         retries_left = self._retries
         corrected = False
+        nudged = False
+        # The last answer that failed the check: shown (flagged) if the retry fails.
+        fallback: tuple[str, tuple[str, ...], LLMReply] | None = None
         for step in range(1, self._max_steps + 1):
             last_step = step == self._max_steps
             if last_step:
@@ -202,11 +208,24 @@ class AgentRunner:
                 continue
             answer = (reply.content or "").strip()
             if not answer:
+                # Reasoning models sometimes spend the whole reply budget thinking and
+                # return no text. Never turn that into an error when there is a
+                # better option: the earlier (flagged) answer, or one more nudge.
+                logger.warning("model returned an empty answer", extra={"step": step})
+                if fallback is not None:
+                    text, problems, failed = fallback
+                    return self._finish(text, VerificationStatus.FAILED, problems, False,
+                                        traces, step, failed)
+                if not nudged and not last_step:
+                    nudged = True
+                    conversation.append({"role": "user", "content": EMPTY_ANSWER_PROMPT})
+                    continue
                 break
             status, problems = verification_of(reply)
             if status is VerificationStatus.FAILED and retries_left and not last_step:
                 retries_left -= 1
                 corrected = True
+                fallback = (answer, problems, reply)
                 logger.warning("answer failed the check; asking the model to correct it",
                                extra={"problems": list(problems), "step": step})
                 conversation.append({"role": "assistant", "content": answer})
@@ -214,6 +233,10 @@ class AgentRunner:
                     problems=", ".join(problems) or "unspecified")})
                 continue
             return self._finish(answer, status, problems, corrected, traces, step, reply)
+        if fallback is not None:
+            text, problems, failed = fallback
+            return self._finish(text, VerificationStatus.FAILED, problems, False, traces,
+                                self._max_steps, failed)
         raise AgentError("no answer within the step budget",
                          details={"model_calls": self._max_steps})
 

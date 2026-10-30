@@ -155,7 +155,7 @@ def test_chat_errors_are_user_safe(client: TestClient, llm: ScriptedLLM) -> None
     assert client.post("/v1/me/chat", json={"message": "x" * 4001}).status_code == 400
     assert client.post("/v1/me/chat", json={"message": "hi", "user_id": "x"}).status_code == 400
 
-    llm.queue(LLMReply(content=""))
+    llm.queue(LLMReply(content=""), LLMReply(content=""))  # empty, nudged, empty again
     failed = client.post("/v1/me/chat", json={"message": "hi"})
     assert failed.status_code == 502
     assert failed.json()["error"]["code"] == "agent_error"
