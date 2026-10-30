@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date
 from typing import Any
 
 import pytest
@@ -24,7 +25,7 @@ from money_agent.agent.runner import (
     VerificationStatus,
     verification_of,
 )
-from money_agent.agent.toolkit import default_tools
+from money_agent.agent.toolkit import add_months, default_tools
 from money_agent.agent.tools import (
     MAX_RESULT_CHARS,
     Tool,
@@ -283,6 +284,7 @@ async def test_goal_tool_takes_a_deadline_and_returns_every_figure(sample_bytes:
     average = plan["average_monthly_saving"]
     assert plan["monthly_surplus"] == f"{float(average) - 12500:.2f}"
     assert plan["months_needed_at_current_pace"] == 3 and plan["monthly_gap"] == "0.00"
+    assert plan["reaches_target_in"] == "2027-01"  # Oct 2026 + 3: no date maths for the model
     for bad in ({"months": 6, "deadline": "2027-06"}, {}, {"deadline": "2026-09"},
                 {"deadline": "2027-13"}, {"deadline": "2040-01"}):
         result = await _run(registry, "plan_savings_goal", target_amount=1000, **bad)
@@ -309,6 +311,13 @@ async def test_budget_exhausted_after_a_failed_check_still_answers() -> None:
                       tool_call("echo", {"text": "a"}), tool_call("echo", {"text": "b"}))
     run = await _runner(llm, max_steps=3).run(CONTEXT, START)
     assert run.answer == "₹1." and run.verification.status is VerificationStatus.FAILED
+
+
+@pytest.mark.parametrize(("today", "months", "month"), [
+    (date(2026, 10, 30), 3, "2027-01"), (date(2026, 12, 1), 1, "2027-01"),
+    (date(2026, 1, 31), 0, "2026-01"), (date(2026, 10, 1), 27, "2029-01")])
+def test_add_months(today: date, months: int, month: str) -> None:
+    assert add_months(today, months) == month
 
 
 def test_tool_schemas_are_compact_but_complete() -> None:

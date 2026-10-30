@@ -220,6 +220,20 @@ class GoalPlanArgs(ToolArgs):
         Decimal(0)
 
 
+def add_months(today: date, months: int) -> str:
+    """The month ``months`` after ``today``'s month, as ``YYYY-MM`` (Oct 2026 + 3: 2027-01).
+
+    Args:
+        today: Today's date.
+        months: Months to add (non-negative).
+
+    Returns:
+        The month.
+    """
+    index = today.year * 12 + today.month - 1 + months
+    return f"{index // 12:04d}-{index % 12 + 1:02d}"
+
+
 def months_until(today: date, deadline: str) -> int:
     """Whole months from ``today``'s month to the deadline month (June from October: 8).
 
@@ -259,7 +273,7 @@ class PlanGoalTool(Tool[GoalPlanArgs]):
         super().__init__(
             "plan_savings_goal",
             "Monthly saving needed to reach a target by a deadline, compared with the "
-            "user's average monthly saving; returns every figure the answer needs.",
+            "user's average monthly saving; returns every figure and date the answer needs.",
             GoalPlanArgs)
         self._finance = finance
 
@@ -285,7 +299,9 @@ class PlanGoalTool(Tool[GoalPlanArgs]):
                 "based_on_months": plan.reference_months, "on_track": plan.on_track,
                 "monthly_gap": money(plan.monthly_gap),
                 "monthly_surplus": money(plan.monthly_surplus),
-                "months_needed_at_current_pace": plan.months_needed_at_pace}
+                "months_needed_at_current_pace": plan.months_needed_at_pace,
+                "reaches_target_in": None if plan.months_needed_at_pace is None
+                else add_months(self._finance.today(), plan.months_needed_at_pace)}
 
 
 # --------------------------------------------------------------------------- #
