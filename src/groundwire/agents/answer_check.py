@@ -92,9 +92,15 @@ _MAX_EVIDENCE_VALUES = 20_000
 # Patterns
 # --------------------------------------------------------------------------- #
 
+# Digit grouping: Indian lakh/crore style first ("1,20,000", "1,23,45,678": groups of
+# two, then a final group of three), then western ("1,234,567"), then plain digits.
+# Without the Indian form, "₹1,20,000" was read as "₹1" and "20,000", so a correct
+# amount was reported as two wrong ones.
 _NUMBER = re.compile(
     r"(?P<cur>[$€£₹¥])?\s?"
-    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?P<num>\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?"
+    r"|\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+    r"|\d+(?:\.\d+)?)"
     r"(?P<pct>\s?%)?")
 _APOSTROPHE = "\u2019"  # typographic apostrophe (U+2019), normalised to an ASCII one
 _WORD = re.compile(r"[A-Za-z][A-Za-z'\u2019]*")

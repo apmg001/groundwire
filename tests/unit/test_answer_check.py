@@ -220,3 +220,36 @@ def test_window_limits_binding() -> None:
     narrow = AnswerChecker(AnswerCheckConfig(window_words=1))
     # "$49.99" is 3 words from "refunded": unbound, and 49.99 is in the order data.
     assert _kinds(narrow, "Refunded, as you asked, $49.99.", REFUNDED_ONE) == []
+
+
+# --------------------------------------------------------------------------- #
+# Number formats
+# --------------------------------------------------------------------------- #
+
+
+def _savings_request(result: dict[str, Any]) -> ChatCompletionRequest:
+    return ChatCompletionRequest(model="default", tools=[_tool("plan_savings_goal")], messages=[
+        {"role": "user", "content": "Can I save for a bike?"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "g1", "type": "function",
+            "function": {"name": "plan_savings_goal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "g1", "content": json.dumps(result)}])
+
+
+@pytest.mark.parametrize("written", ["₹1,20,000", "₹1,20,000.00", "1,20,000", "120000",
+                                     "₹120,000", "₹ 1,20,000"])
+def test_indian_digit_grouping_is_one_number(checker: AnswerChecker, written: str) -> None:
+    # Found with a real model: "₹1,20,000" was read as "₹1" and "20,000", so a correct
+    # answer was flagged twice.
+    request = _savings_request({"target": "120000.00", "required_monthly": "15000.00"})
+    answer = f"Your target is {written} and you need ₹15,000.00 a month."
+    assert _kinds(checker, answer, request) == []
+
+
+@pytest.mark.parametrize(("written", "value"), [
+    ("₹12,34,567.50", "1234567.50"), ("₹1,23,45,678", "12345678"), ("₹99,999", "99999")])
+def test_lakh_and_crore_amounts_are_compared_exactly(checker: AnswerChecker, written: str,
+                                                     value: str) -> None:
+    request = _savings_request({"target": value})
+    assert _kinds(checker, f"The target is {written}.", request) == []
+    assert _kinds(checker, f"The target is {written[:-1]}1.", request) == ["number_mismatch"]
